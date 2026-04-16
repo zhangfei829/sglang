@@ -9,7 +9,6 @@ Follows the same pattern as MooncakeStore:
 import logging
 import os
 import socket
-import threading
 from typing import Any, List, Optional
 
 import torch
@@ -501,7 +500,6 @@ class UMBPStore(HiCacheStorage):
                 cfg.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
         self.client = UMBPClient(cfg)
-        self._lock = threading.Lock()
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
 
@@ -628,8 +626,7 @@ class UMBPStore(HiCacheStorage):
         else:
             sizes = list(buffer_sizes)
 
-        with self._lock:
-            get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
+        get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
         return self._batch_postprocess(get_results)
 
     def _compute_expanded_depths(
@@ -685,15 +682,14 @@ class UMBPStore(HiCacheStorage):
 
         expanded_depths = self._compute_expanded_depths(keys, extra_info)
 
-        with self._lock:
-            if expanded_depths:
-                put_results = self.client.batch_put_from_ptr_with_depth(
-                    key_strs, list(buffer_ptrs), sizes, expanded_depths
-                )
-            else:
-                put_results = self.client.batch_put_from_ptr(
-                    key_strs, list(buffer_ptrs), sizes
-                )
+        if expanded_depths:
+            put_results = self.client.batch_put_from_ptr_with_depth(
+                key_strs, list(buffer_ptrs), sizes, expanded_depths
+            )
+        else:
+            put_results = self.client.batch_put_from_ptr(
+                key_strs, list(buffer_ptrs), sizes
+            )
 
         return self._batch_postprocess(put_results, is_set_operate=True)
 
@@ -718,8 +714,7 @@ class UMBPStore(HiCacheStorage):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        with self._lock:
-            hit_count = self.client.batch_exists_consecutive(query_keys)
+        hit_count = self.client.batch_exists_consecutive(query_keys)
         return hit_count // key_multiplier
 
     # ------------------------------------------------------------------
@@ -733,8 +728,7 @@ class UMBPStore(HiCacheStorage):
     ) -> torch.Tensor | None:
         if target_location is None or target_sizes is None:
             return None
-        with self._lock:
-            ok = self.client.get_into_ptr(key, target_location, target_sizes)
+        ok = self.client.get_into_ptr(key, target_location, target_sizes)
         return target_location if ok else None
 
     def batch_get(
@@ -746,12 +740,11 @@ class UMBPStore(HiCacheStorage):
         if not keys:
             return 0
         assert len(keys) == len(target_locations) == len(target_sizes)
-        with self._lock:
-            results = self.client.batch_get_into_ptr(
-                keys,
-                list(target_locations),
-                list(target_sizes),
-            )
+        results = self.client.batch_get_into_ptr(
+            keys,
+            list(target_locations),
+            list(target_sizes),
+        )
         for i, ok in enumerate(results):
             if not ok:
                 return i
@@ -768,8 +761,7 @@ class UMBPStore(HiCacheStorage):
             return True
         if target_location is None or target_sizes is None:
             return False
-        with self._lock:
-            return self.client.put_from_ptr(key, target_location, target_sizes)
+        return self.client.put_from_ptr(key, target_location, target_sizes)
 
     def batch_set(
         self,
@@ -783,27 +775,23 @@ class UMBPStore(HiCacheStorage):
         if self.is_mla_follower:
             return True
         assert len(keys) == len(target_locations) == len(target_sizes)
-        with self._lock:
-            results = self.client.batch_put_from_ptr(
-                keys,
-                list(target_locations),
-                list(target_sizes),
-            )
+        results = self.client.batch_put_from_ptr(
+            keys,
+            list(target_locations),
+            list(target_sizes),
+        )
         return all(results)
 
     def exists(self, key: str) -> bool:
-        with self._lock:
-            return self.client.exists(key)
+        return self.client.exists(key)
 
     def clear(self) -> None:
-        with self._lock:
-            self.client.clear()
+        self.client.clear()
 
     def flush(self) -> bool:
         if self.client is None or not hasattr(self.client, "flush"):
             return True
-        with self._lock:
-            return bool(self.client.flush())
+        return bool(self.client.flush())
 
     def close(self) -> None:
         if getattr(self, "client", None) is None:
