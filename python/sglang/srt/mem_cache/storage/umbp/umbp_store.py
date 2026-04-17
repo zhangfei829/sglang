@@ -216,10 +216,10 @@ class UMBPStore(HiCacheStorage):
                 cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
         if "ssd_backend" in extra:
             ssd_backend = str(extra["ssd_backend"]).strip().lower()
-            if ssd_backend not in ("posix", "spdk", "spdk_proxy"):
+            if ssd_backend not in ("posix", "spdk", "spdk_proxy", "dummy_storage"):
                 raise ValueError(
                     "extra_config['ssd_backend'] must be one of: "
-                    "posix, spdk, spdk_proxy"
+                    "posix, spdk, spdk_proxy, dummy_storage"
                 )
             cfg.ssd_backend = ssd_backend
         if "spdk_nvme_pci_addr" in extra:

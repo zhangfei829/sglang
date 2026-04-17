@@ -37,8 +37,9 @@ UMBP_SSD_DURABILITY_MODE="${UMBP_SSD_DURABILITY_MODE:-relaxed}"
 UMBP_COPY_TO_SSD_ASYNC="${UMBP_COPY_TO_SSD_ASYNC:-true}"
 UMBP_SSD_WRITER_THREADS="${UMBP_SSD_WRITER_THREADS:-4}"
 
-# SPDK backend (set UMBP_SSD_BACKEND=spdk_proxy to enable)
-UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"          # posix | spdk_proxy
+# SSD backend: posix | spdk_proxy | dummy_storage
+# dummy_storage: fake tier that tracks keys in memory without real I/O (for policy tuning)
+UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"
 UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-}"           # e.g. 0000:89:00.0
 UMBP_SPDK_PROXY_AUTO_START="${UMBP_SPDK_PROXY_AUTO_START:-true}"
 UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS="${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS:-60000}"
