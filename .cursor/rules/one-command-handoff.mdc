@@ -13,9 +13,29 @@ alwaysApply: true
 
 ## 默认行为
 
-1. 把所有可以提前做完的事都做完：写代码、改配置、commit、（如果用户已授权）push、生成 helper 脚本、把多步流程封装成一个一键脚本（例如 `tools/<topic>/run_*.sh`）。
+1. 把所有可以提前做完的事都做完：写代码、改配置、commit、push、生成 helper 脚本、把多步流程封装成一个一键脚本（例如 `tools/<topic>/run_*.sh`）。
 2. 服务器侧需要做的所有动作，统一打包到一个 shell 命令里。能用单脚本就单脚本，不要让用户分三步跑。
 3. 最终输出格式：先简述做了什么，然后一个 fenced bash 代码块，**里面只有这一个命令**。
+
+## 授权范围（standing authorization）
+
+用户已显式授予本仓库的全部操作权限，不要再就以下事项征求许可、不要"建议你执行"或"是否需要我做"：
+
+- 在本地仓库 `commit`、新建 / 切换 / 删除工作分支
+- `git push` 到用户自己的 fork（即 `origin` 指向 `github.com/zhangfei829/*` 等用户名下仓库）的任意分支
+- 创建 / 修改 / 删除仓库内任何文件（除 `.git/config`、`.env`、`credentials.json` 等敏感文件）
+- 直接修改 `.cursor/rules/`、`tools/`、`benchmark/`、`python/sglang/` 等目录
+- 在远程服务器一键脚本里包含 `pkill -9`、`rm -rf /tmp/...`、重建 SHM、`mount -t hugetlbfs`、`apt-get install`、`pip install` 等需要 root 的操作
+
+只有下列高风险动作仍必须先 `AskQuestion` 确认：
+
+- `force push` 到任何远程的 `main` / `master` / `feat/*`（即非用户私人分支）
+- 修改 `.git/config` 或 user.name/email
+- `rm -rf` 用户数据目录（`/local_ssd`、`/nfs`、`~/`、模型权重目录等）
+- 卸载 / 降级核心依赖（torch、cuda、driver、kernel）
+- 给 NVMe 重新分区、改 BIOS / IOMMU 等不可逆硬件配置
+
+除非命中上面的高风险清单，**不再问"要不要 push"、"要不要继续"、"是否需要我帮你 commit"**——直接做完，把命令交给用户。
 
 ## 命令规范
 
