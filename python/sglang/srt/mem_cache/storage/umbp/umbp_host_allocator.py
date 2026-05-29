@@ -37,6 +37,20 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
             ) from exc
 
         self._mod = umbp_mod
+        # mori >= 1.1.2 removed UMBPHostMemAllocator / UMBPHostBufferBacking
+        # from the pybind surface (the host-side allocator is now managed
+        # internally by UMBPClient).  Detect that case and surface a clean
+        # RuntimeError so the caller in memory_pool_host.get_allocator_from_storage
+        # falls back to the default torch.empty allocator instead of a noisy
+        # AttributeError stack trace at scheduler init.
+        if not hasattr(umbp_mod, "UMBPHostMemAllocator") or not hasattr(
+            umbp_mod, "UMBPHostBufferBacking"
+        ):
+            raise RuntimeError(
+                "mori.umbp does not expose UMBPHostMemAllocator / "
+                "UMBPHostBufferBacking (mori build is too new or pybind "
+                "trimmed it). Falling back to default torch host allocator."
+            )
         self._allocator = umbp_mod.UMBPHostMemAllocator()
 
         self._use_hugepage = _bool_env("SGLANG_HICACHE_HOST_HUGEPAGE", True)

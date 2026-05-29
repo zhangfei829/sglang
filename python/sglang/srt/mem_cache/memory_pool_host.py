@@ -95,7 +95,7 @@ def get_allocator_from_storage(allocator_type):
             )
 
             return UMBPHostTensorAllocator()
-        except (ImportError, RuntimeError) as exc:
+        except (ImportError, RuntimeError, AttributeError) as exc:
             logger.warning(
                 "UMBPHostTensorAllocator unavailable (%s). "
                 "Falling back to torch.empty-based allocator.",
