@@ -1,0 +1,73 @@
+---
+description: 一键交付：每个可执行任务最终只给用户一个可复制粘贴的命令
+alwaysApply: true
+---
+
+# 一键交付（One-Command Handoff）
+
+## 适用场景
+
+当任务最终要由用户在某个 shell（本机或远程服务器，例如 `/sgl-workspace/sglang`）里"跑一下"时（搭环境、跑 benchmark、复现 bug、起服务、抓日志、回归测试等），整次会话的输出最终**只有一个可复制粘贴的命令**。
+
+不适用：纯问答、读代码解释、设计讨论、需要用户在多个互斥方案之间做决策。
+
+## 默认行为
+
+1. 把所有可以提前做完的事都做完：写代码、改配置、commit、（如果用户已授权）push、生成 helper 脚本、把多步流程封装成一个一键脚本（例如 `tools/<topic>/run_*.sh`）。
+2. 服务器侧需要做的所有动作，统一打包到一个 shell 命令里。能用单脚本就单脚本，不要让用户分三步跑。
+3. 最终输出格式：先简述做了什么，然后一个 fenced bash 代码块，**里面只有这一个命令**。
+
+## 命令规范
+
+- 必须可以"原样复制粘贴到目标 shell"就能执行，不能含占位符；如果必须有变量，用 `VAR=...` 前缀写在同一行 / 同一个 `bash -c` 里。
+- 多步流程优先封装为一个脚本（已在仓库里），命令直接调用脚本。
+- 多步实在无法封装时（例如必须先 cd，再切分支，再跑），用 `&&` 串成一行；bash 脚本主体放在 `bash -c '...'` 里也可以。
+- 服务器侧 git 拉取一律用 HTTPS，不要让用户去配 SSH key。
+- 如果命令可能跑很久，命令里自带 `nohup ... &` 或 `tmux new -s <name> -d '...'` 之类的后台化，不要让用户自己想。
+- 命令本身要做必要的前置清理（kill 旧进程、创建目录、校验环境），用户复制后不需要"先做一些准备工作"。
+
+## 输出结构
+
+```
+<1-3 段简短说明：本次会话做了什么、这条命令会发生什么、产物在哪。>
+
+```bash
+<the single command>
+```
+
+<可选：1-2 行后置提示，例如"跑完看 RESULTS_DIR/summary.txt"。>
+```
+
+不要再追加"备选命令"、"如果失败可以这样"、"另外你也可以"。如果有真正必要的二选一，**只给一条**，把另一种写成脚本里的 env 开关。
+
+## 反面示例
+
+不要这样输出（不止一个命令、要求用户分步执行）：
+
+```bash
+cd /sgl-workspace/sglang
+pkill -f "sglang.launch_server" || true
+git fetch origin test/xxx
+git checkout test/xxx
+bash benchmark/hicache/run_xxx.sh
+grep -RniE "bandwidth_gib_s" results/...
+```
+
+## 正面示例
+
+```bash
+cd /sgl-workspace/sglang && \
+    chmod +x tools/iobw/run_umbp_iobw_test.sh && \
+    BRANCH=test/umbp-io-bandwidth-stats-tools \
+    tools/iobw/run_umbp_iobw_test.sh
+```
+
+脚本里负责 kill 旧进程、HTTPS 拉新分支、跑 bench、收集 JSONL、汇总输出。
+
+## 例外
+
+只有以下情况可以不给单条命令：
+
+- 用户**显式**问"我应该跑哪几步" / "告诉我每一步做了什么"。
+- 命令需要用户先做一个**只能由人做**的选择（例如选 GPU、确认要不要 `rm -rf` 用户数据）—— 这种情况先用 AskQuestion 收齐选择再回到本规则。
+- 任务本身不会落到 shell 上（例如纯代码解释、设计讨论）。
