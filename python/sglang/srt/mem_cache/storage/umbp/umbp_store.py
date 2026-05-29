@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import socket
+import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 import torch
@@ -485,6 +487,27 @@ class UMBPStore(HiCacheStorage):
         self._io_bw_aggregate = {}
         self._io_bw_records_dropped = 0
         self._io_bw_stats_printed = False
+        # JSONL side-channel: survives SIGKILL / logger flush issues.
+        # File is opened lazily on the first record so we already know the
+        # final rank / pp_rank / tp_size at construction time.
+        self._io_bw_jsonl_enabled = _bool_from_any(
+            extra.get(
+                "io_bandwidth_stats_jsonl",
+                os.getenv("UMBP_IO_BW_STATS_JSONL", "true"),
+            )
+        )
+        self._io_bw_jsonl_fsync = _bool_from_any(
+            extra.get(
+                "io_bandwidth_stats_jsonl_fsync",
+                os.getenv("UMBP_IO_BW_STATS_JSONL_FSYNC", "false"),
+            )
+        )
+        self._io_bw_jsonl_dir = extra.get(
+            "io_bandwidth_stats_dir",
+            _optional_env_str("UMBP_IO_BW_STATS_DIR"),
+        )
+        self._io_bw_jsonl_file = None
+        self._io_bw_jsonl_path = None
 
         # MLA + TP > 1: shared SSD mode (standalone only).
         # In distributed mode every rank is a peer of the master-led pool; we
@@ -814,6 +837,120 @@ class UMBPStore(HiCacheStorage):
     # ------------------------------------------------------------------
     # Zero-copy v1 interface
     # ------------------------------------------------------------------
+    def _io_bw_jsonl_open(self) -> None:
+        """Open the IOBW JSONL side-channel lazily on first use.
+
+        Resolution order for the output directory:
+          1. ``UMBP_IO_BW_STATS_DIR`` / ``io_bandwidth_stats_dir`` extra
+          2. ``SGLANG_LOG_DIR``
+          3. cwd ``./umbp_iobw_logs``
+          4. ``${TMPDIR}/umbp_iobw_logs`` (fallback when cwd is not writable)
+        """
+        if self._io_bw_jsonl_file is not None:
+            return
+        if not self._io_bw_jsonl_enabled or not self._io_bw_stats_enabled:
+            return
+
+        candidates = []
+        if self._io_bw_jsonl_dir:
+            candidates.append(self._io_bw_jsonl_dir)
+        sglang_log_dir = _optional_env_str("SGLANG_LOG_DIR")
+        if sglang_log_dir:
+            candidates.append(os.path.join(sglang_log_dir, "umbp_iobw_logs"))
+        candidates.append(os.path.join(os.getcwd(), "umbp_iobw_logs"))
+        candidates.append(os.path.join(tempfile.gettempdir(), "umbp_iobw_logs"))
+
+        target_dir = None
+        for c in candidates:
+            try:
+                os.makedirs(c, exist_ok=True)
+                # Probe writability by opening a small file.
+                probe = os.path.join(c, ".iobw_writable_probe")
+                with open(probe, "w"):
+                    pass
+                os.unlink(probe)
+                target_dir = c
+                break
+            except OSError:
+                continue
+
+        if target_dir is None:
+            logger.warning(
+                "[UMBPStore][IOBW] no writable directory found among %s; "
+                "JSONL side-channel disabled",
+                candidates,
+            )
+            self._io_bw_jsonl_enabled = False
+            return
+
+        host = socket.gethostname()
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        fname = (
+            f"iobw_{host}_pid{os.getpid()}_dp{getattr(self, 'dp_rank', 'x')}_"
+            f"tp{self.local_rank}_pp{self.pp_rank}_{ts}_{_PROCESS_INSTANCE_TOKEN}.jsonl"
+        )
+        path = os.path.join(target_dir, fname)
+        try:
+            self._io_bw_jsonl_file = open(path, "a", buffering=1)
+        except OSError as exc:
+            logger.warning(
+                "[UMBPStore][IOBW] failed to open JSONL file %s: %s; "
+                "JSONL side-channel disabled",
+                path,
+                exc,
+            )
+            self._io_bw_jsonl_enabled = False
+            return
+
+        self._io_bw_jsonl_path = path
+
+        # Write a one-shot "open" header for cross-referencing with server.log.
+        header = {
+            "type": "open",
+            "ts": time.time(),
+            "host": host,
+            "pid": os.getpid(),
+            "local_rank": self.local_rank,
+            "pp_rank": self.pp_rank,
+            "tp_size": self.tp_size,
+            "process_token": _PROCESS_INSTANCE_TOKEN,
+        }
+        self._io_bw_jsonl_write(header)
+        logger.info(
+            "[UMBPStore][IOBW] JSONL side-channel opened: %s (fsync=%s)",
+            path,
+            self._io_bw_jsonl_fsync,
+        )
+
+    def _io_bw_jsonl_write(self, record: dict) -> None:
+        f = self._io_bw_jsonl_file
+        if f is None:
+            return
+        try:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            # line-buffered open() already flushes on \n, but be explicit.
+            f.flush()
+            if self._io_bw_jsonl_fsync:
+                os.fsync(f.fileno())
+        except (OSError, ValueError):
+            # Don't let a logging failure abort the IO path.
+            pass
+
+    def _io_bw_jsonl_close(self) -> None:
+        f = getattr(self, "_io_bw_jsonl_file", None)
+        if f is None:
+            return
+        try:
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+            f.close()
+        except (OSError, ValueError):
+            pass
+        self._io_bw_jsonl_file = None
+
     def _record_io_bandwidth(
         self,
         op: str,
@@ -870,6 +1007,28 @@ class UMBPStore(HiCacheStorage):
         else:
             self._io_bw_records_dropped += 1
 
+        # Side-channel: append-and-flush per call so SIGKILL / logger buffering
+        # can't lose per-call records.  This is critical when the process is
+        # torn down by `timeout --signal=TERM --kill-after=30` or by an OOM
+        # killer before atexit runs.
+        if self._io_bw_jsonl_enabled:
+            if self._io_bw_jsonl_file is None:
+                self._io_bw_jsonl_open()
+            self._io_bw_jsonl_write(
+                {
+                    "type": "call",
+                    "ts": time.time(),
+                    "op": op,
+                    "requests": request_count,
+                    "expanded": expanded_count,
+                    "success": success_count,
+                    "total_bytes": total_bytes,
+                    "success_bytes": success_bytes,
+                    "elapsed_s": elapsed_s,
+                    "bandwidth_gib_s": bandwidth_gib_s,
+                }
+            )
+
     def _print_io_bandwidth_stats(self) -> None:
         if not getattr(self, "_io_bw_stats_enabled", False):
             return
@@ -879,6 +1038,17 @@ class UMBPStore(HiCacheStorage):
 
         if not self._io_bw_aggregate:
             logger.info("[UMBPStore][IOBW] no BatchGet/BatchPut calls recorded")
+            if self._io_bw_jsonl_enabled and self._io_bw_jsonl_file is not None:
+                self._io_bw_jsonl_write(
+                    {
+                        "type": "summary",
+                        "ts": time.time(),
+                        "ops": {},
+                        "records_collected": 0,
+                        "records_dropped": 0,
+                    }
+                )
+                self._io_bw_jsonl_close()
             return
 
         logger.info(
@@ -907,6 +1077,7 @@ class UMBPStore(HiCacheStorage):
                 record["bandwidth_gib_s"],
             )
 
+        summary_payload = {}
         for op, stats in sorted(self._io_bw_aggregate.items()):
             aggregate_bandwidth = (
                 stats["success_bytes"] / max(stats["elapsed_s"], 1e-12) / (1024**3)
@@ -926,6 +1097,29 @@ class UMBPStore(HiCacheStorage):
                 aggregate_bandwidth,
                 stats["max_bandwidth_gib_s"],
             )
+            summary_payload[op] = {
+                "calls": stats["calls"],
+                "requests": stats["requests"],
+                "expanded": stats["expanded"],
+                "success": stats["success"],
+                "total_bytes": stats["total_bytes"],
+                "success_bytes": stats["success_bytes"],
+                "elapsed_s": stats["elapsed_s"],
+                "avg_bandwidth_gib_s": aggregate_bandwidth,
+                "max_call_bandwidth_gib_s": stats["max_bandwidth_gib_s"],
+            }
+
+        if self._io_bw_jsonl_enabled and self._io_bw_jsonl_file is not None:
+            self._io_bw_jsonl_write(
+                {
+                    "type": "summary",
+                    "ts": time.time(),
+                    "ops": summary_payload,
+                    "records_collected": len(self._io_bw_records),
+                    "records_dropped": self._io_bw_records_dropped,
+                }
+            )
+            self._io_bw_jsonl_close()
 
     def batch_get_v1(
         self,
