@@ -6,10 +6,12 @@ Follows the same pattern as MooncakeStore:
 - Key suffix generation per TP rank / PP rank
 """
 
+import atexit
 import json
 import logging
 import os
 import socket
+import time
 import uuid
 from typing import Any, List, Optional
 
@@ -467,6 +469,22 @@ class UMBPStore(HiCacheStorage):
             )
 
         self.storage_config = storage_config
+        io_bw_stats = extra.get(
+            "io_bandwidth_stats", _optional_env_str("UMBP_IO_BW_STATS")
+        )
+        self._io_bw_stats_enabled = (
+            True if io_bw_stats is None else _bool_from_any(io_bw_stats)
+        )
+        self._io_bw_stats_max_records = int(
+            extra.get(
+                "io_bandwidth_stats_max_records",
+                os.getenv("UMBP_IO_BW_STATS_MAX_RECORDS", "100000"),
+            )
+        )
+        self._io_bw_records = []
+        self._io_bw_aggregate = {}
+        self._io_bw_records_dropped = 0
+        self._io_bw_stats_printed = False
 
         # MLA + TP > 1: shared SSD mode (standalone only).
         # In distributed mode every rank is a peer of the master-led pool; we
@@ -619,6 +637,8 @@ class UMBPStore(HiCacheStorage):
                 cfg.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
         self.client = UMBPClient(cfg)
+        if self._io_bw_stats_enabled:
+            atexit.register(self._print_io_bandwidth_stats)
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
 
@@ -794,6 +814,119 @@ class UMBPStore(HiCacheStorage):
     # ------------------------------------------------------------------
     # Zero-copy v1 interface
     # ------------------------------------------------------------------
+    def _record_io_bandwidth(
+        self,
+        op: str,
+        total_bytes: int,
+        success_bytes: int,
+        request_count: int,
+        expanded_count: int,
+        success_count: int,
+        elapsed_s: float,
+    ) -> None:
+        if not getattr(self, "_io_bw_stats_enabled", False):
+            return
+
+        elapsed_s = max(elapsed_s, 1e-12)
+        bandwidth_gib_s = success_bytes / elapsed_s / (1024**3)
+
+        stats = self._io_bw_aggregate.setdefault(
+            op,
+            {
+                "calls": 0,
+                "requests": 0,
+                "expanded": 0,
+                "success": 0,
+                "total_bytes": 0,
+                "success_bytes": 0,
+                "elapsed_s": 0.0,
+                "max_bandwidth_gib_s": 0.0,
+            },
+        )
+        stats["calls"] += 1
+        stats["requests"] += request_count
+        stats["expanded"] += expanded_count
+        stats["success"] += success_count
+        stats["total_bytes"] += total_bytes
+        stats["success_bytes"] += success_bytes
+        stats["elapsed_s"] += elapsed_s
+        stats["max_bandwidth_gib_s"] = max(
+            stats["max_bandwidth_gib_s"], bandwidth_gib_s
+        )
+
+        if len(self._io_bw_records) < self._io_bw_stats_max_records:
+            self._io_bw_records.append(
+                {
+                    "op": op,
+                    "requests": request_count,
+                    "expanded": expanded_count,
+                    "success": success_count,
+                    "total_bytes": total_bytes,
+                    "success_bytes": success_bytes,
+                    "elapsed_s": elapsed_s,
+                    "bandwidth_gib_s": bandwidth_gib_s,
+                }
+            )
+        else:
+            self._io_bw_records_dropped += 1
+
+    def _print_io_bandwidth_stats(self) -> None:
+        if not getattr(self, "_io_bw_stats_enabled", False):
+            return
+        if getattr(self, "_io_bw_stats_printed", False):
+            return
+        self._io_bw_stats_printed = True
+
+        if not self._io_bw_aggregate:
+            logger.info("[UMBPStore][IOBW] no BatchGet/BatchPut calls recorded")
+            return
+
+        logger.info(
+            "[UMBPStore][IOBW] per-call storage bandwidth records: count=%d dropped=%d "
+            "rank=%d pp_rank=%d tp_size=%d",
+            len(self._io_bw_records),
+            self._io_bw_records_dropped,
+            self.local_rank,
+            self.pp_rank,
+            self.tp_size,
+        )
+        for idx, record in enumerate(self._io_bw_records, start=1):
+            logger.info(
+                "[UMBPStore][IOBW] #%05d op=%s requests=%d expanded=%d "
+                "success=%d/%d total_bytes=%d success_bytes=%d elapsed_ms=%.3f "
+                "bandwidth_gib_s=%.3f",
+                idx,
+                record["op"],
+                record["requests"],
+                record["expanded"],
+                record["success"],
+                record["expanded"],
+                record["total_bytes"],
+                record["success_bytes"],
+                record["elapsed_s"] * 1000,
+                record["bandwidth_gib_s"],
+            )
+
+        for op, stats in sorted(self._io_bw_aggregate.items()):
+            aggregate_bandwidth = (
+                stats["success_bytes"] / max(stats["elapsed_s"], 1e-12) / (1024**3)
+            )
+            logger.info(
+                "[UMBPStore][IOBW] summary op=%s calls=%d requests=%d expanded=%d "
+                "success=%d total_bytes=%d success_bytes=%d elapsed_ms=%.3f "
+                "avg_bandwidth_gib_s=%.3f max_call_bandwidth_gib_s=%.3f",
+                op,
+                stats["calls"],
+                stats["requests"],
+                stats["expanded"],
+                stats["success"],
+                stats["total_bytes"],
+                stats["success_bytes"],
+                stats["elapsed_s"] * 1000,
+                aggregate_bandwidth,
+                stats["max_bandwidth_gib_s"],
+            )
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -818,12 +951,27 @@ class UMBPStore(HiCacheStorage):
             len(key_strs),
             total_bytes,
         )
+        start_time = time.perf_counter()
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
+        elapsed_s = time.perf_counter() - start_time
         success_count = sum(1 for r in get_results if r)
+        success_bytes = sum(size for size, ok in zip(sizes, get_results) if ok)
+        self._record_io_bandwidth(
+            "BatchGet",
+            total_bytes,
+            success_bytes,
+            len(keys),
+            len(key_strs),
+            success_count,
+            elapsed_s,
+        )
         logger.info(
-            "[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d",
+            "[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d "
+            "elapsed_ms=%.3f bandwidth_gib_s=%.3f",
             success_count,
             len(get_results),
+            elapsed_s * 1000,
+            success_bytes / max(elapsed_s, 1e-12) / (1024**3),
         )
         return self._batch_postprocess(get_results)
 
@@ -890,6 +1038,7 @@ class UMBPStore(HiCacheStorage):
             bool(expanded_depths),
         )
 
+        start_time = time.perf_counter()
         if expanded_depths:
             put_results = self.client.batch_put_from_ptr_with_depth(
                 key_strs, list(buffer_ptrs), sizes, expanded_depths
@@ -898,12 +1047,26 @@ class UMBPStore(HiCacheStorage):
             put_results = self.client.batch_put_from_ptr(
                 key_strs, list(buffer_ptrs), sizes
             )
+        elapsed_s = time.perf_counter() - start_time
 
         success_count = sum(1 for r in put_results if r)
+        success_bytes = sum(size for size, ok in zip(sizes, put_results) if ok)
+        self._record_io_bandwidth(
+            "BatchPut",
+            total_bytes,
+            success_bytes,
+            len(keys),
+            len(key_strs),
+            success_count,
+            elapsed_s,
+        )
         logger.info(
-            "[UMBPStore] batch_set_v1: UMBP BatchPut done: success=%d/%d",
+            "[UMBPStore] batch_set_v1: UMBP BatchPut done: success=%d/%d "
+            "elapsed_ms=%.3f bandwidth_gib_s=%.3f",
             success_count,
             len(put_results),
+            elapsed_s * 1000,
+            success_bytes / max(elapsed_s, 1e-12) / (1024**3),
         )
         return self._batch_postprocess(put_results, is_set_operate=True)
 
@@ -1015,4 +1178,5 @@ class UMBPStore(HiCacheStorage):
             self.flush()
         except Exception:
             logger.exception("UMBPStore flush during close failed")
+        self._print_io_bandwidth_stats()
         self.client = None
