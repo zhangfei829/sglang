@@ -1,0 +1,33 @@
+---
+description: 优先复用验证过的命令/配置，别自己瞎试参数
+alwaysApply: true
+---
+
+# 复用验证过的命令与方法（Reuse Verified Config）
+
+跑 benchmark / 起服务 / 复现实验前，**先找历史上已经跑通的那条命令和参数，原样复用**，不要凭感觉重新猜参数值。
+
+## 为什么
+
+自己瞎调参数会反复踩坑、浪费大量轮次。典型反面案例：sglang case3 已有 banff 跑通配置
+`MEM_FRACTION_STATIC=0.8 MAX_TOTAL_TOKENS=600000 HICACHE_SIZE=128`，却自己改成
+`HICACHE_SIZE=8/32` 且漏了 `MAX_TOTAL_TOKENS`，连续撞 "host memory should be larger
+than device memory"、"Not enough memory" 等本可避免的报错。
+
+## 做法
+
+1. **先查历史**：动手前先在 agent-transcripts、`benchmark/**/results/*/summary.txt`、
+   `server.log`、脚本默认值、README 里找"上一次成功跑通"的完整命令和参数。
+2. **整条复用**：找到就**原样照搬**那条命令（含所有 env：MEM_FRACTION_STATIC、
+   MAX_TOTAL_TOKENS、HICACHE_SIZE、UMBP_SSD_BACKEND、PCI、模型路径等），只改这次真正
+   需要变的一两个量。
+3. **改参数要有依据**：必须改 sizing 类参数时，先从日志拿到约束量（如设备 KV 池 GB、
+   权重占用、HBM 容量），按约束算出取值，而不是试错。例如 `HICACHE_SIZE` 必须 > 设备
+   KV 池；设备池可用 `MAX_TOTAL_TOKENS` 封顶来缩小。
+4. **环境差异显式核对**：换机器/容器时，先确认与历史环境的差异（GPU 数、HBM、NIC、
+   mori 分支、SPDK 是否就绪），差异点才需要调整，其余照搬。
+5. 验证过的配置值得记下来（写进脚本默认值或 README），下次直接用。
+
+## 一句话
+
+有跑通的就照抄，没跑通的先查历史再算，别拍脑袋试参数。
