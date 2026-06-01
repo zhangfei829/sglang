@@ -1,0 +1,57 @@
+---
+description: SPDK/UMBP 跑 sglang 前的运行时环境检查与恢复（重启/容器重启后必做）
+alwaysApply: true
+---
+
+# SPDK/UMBP 运行时环境设置（skyriver07 等多核机）
+
+跑 `UMBP_SSD_BACKEND=spdk_proxy` 的 sglang bench 前，**先确认下列运行时状态**。
+这些状态**重启 / 容器重启后全部丢失**，每次都要重做——不要等报错了才查。
+
+## 持久（编译产物，重启不丢，无需重做）
+
+- `/home/fizhang/spdk`：已 `--with-shared --max-lcores=512 --without-nvme-cuse` 编好（含
+  `MAX_CPU_CORES 128→512` 改动，app.c:44）。
+- mori main（带 UMBP+SPDK，spdk_proxy 在 `/opt/venv/lib/python3.10/site-packages/mori/spdk_proxy`）。
+- sglang 分支 `test/umbp-io-bandwidth-stats-tools`、模型 `/mnt/nvme1/data/DeepSeekV3.1`。
+- `/etc/ld.so.conf.d/zzz-spdk.conf`（但重启后要重跑 `ldconfig` 刷缓存）。
+
+## 易丢（重启/容器重启后必做，按此恢复）
+
+| 项 | 检查 | 恢复 |
+|---|---|---|
+| hugepage 分配 | `grep . /sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages` | `echo 24576 > .../node0/.../nr_hugepages; echo 24576 > .../node1/.../nr_hugepages`（48GB/node，proxy ring 32GB+余量） |
+| hugetlbfs 挂载 | `mount \| grep -i huge` | `mkdir -p /dev/hugepages; mount -t hugetlbfs nodev /dev/hugepages` |
+| vfio-pci 绑定 | `basename $(readlink /sys/bus/pci/devices/0000:88:00.0/driver)` | host: unbind nvme → `driver_override=vfio-pci` → bind（88/c3） |
+| /dev/vfio 节点 | `ls -l /dev/vfio/`（要有 group 110/141） | 取 `cat /sys/class/vfio/110/dev`(=239:0) `/141`(=239:1)，容器内 `mknod -m666 /dev/vfio/110 c 239 0; mknod -m666 /dev/vfio/141 c 239 1` |
+| ldconfig 缓存 | `ldconfig -p \| grep libspdk_event` | `ldconfig` |
+| 容器 cpuset | `cat /sys/fs/cgroup/cpuset.cpus.effective`（要 0-383） | host: 放开 docker 父级+容器层 cpuset 到 0-383 |
+| SPDK 残留 | `ls /var/tmp/spdk* /dev/hugepages/umbp_spdk_proxy` | `rm -f /var/tmp/spdk_cpu_lock_* /var/tmp/spdk.sock* /dev/hugepages/umbp_spdk_proxy; rm -rf /var/run/dpdk/spdk_pid*` |
+
+## 常见报错 → 根因 → 修法
+
+- `EAL: FATAL: Cannot get hugepage information` → /dev/hugepages 没挂 或 nr_hugepages=0 → 挂载 + 设 nr。
+- `EAL: No free 2048 kB hugepages reported on node N` → 该 node hugepage 被占光/不足（proxy ring 要 32GB）→ 加大 nr，清 `/dev/hugepages/umbp_spdk_proxy` 残留。
+- `spdk_app_start returned rc=1` + `unclaim_cpu_cores: Failed to unlink lock fd for core 0` → 真因看上面几行（多半是上面的 hugepage 错），unclaim 那行是回滚噪声。
+- `claim_cpu_cores ... g_core_locks` segfault → `MAX_CPU_CORES=128` < 机器核数；改 512 重编 `libspdk_event.so`（注意要 `--with-shared` 才会重链 .so）。
+- `host memory should be larger than device memory` → `HICACHE_SIZE` < 设备 KV 池；用 banff 验证值 `HICACHE_SIZE=128 + --max-total-tokens 600000 + --mem-fraction-static 0.8`。
+- `not eligible; choose between [0..127]` → 容器 cpuset 被裁到 0-127 → 放开到 0-383。
+- `memory capacity unbalanced ... local_gpu_memory=~1.4GB` → 8 卡被别的任务占满（共享机争用）→ 等 GPU 空闲，别乱杀别人任务。
+- `symmetric_memory.cpp hip failed / Cuda failure invalid argument`（MoE）→ 用 mori main（含 #344 skip RDMA MR when no peers）。
+
+## 验证过的跑通命令（reuse，不要瞎改参数）
+
+```
+EXTRA_SERVER_ARGS="--mem-fraction-static 0.8 --max-total-tokens 600000" \
+HICACHE_SIZE=128 SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384 \
+MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1 UMBP_SSD_BACKEND=spdk_proxy \
+UMBP_SPDK_NVME_PCI=0000:88:00.0 \
+UMBP_SPDK_PROXY_BIN=/opt/venv/lib/python3.10/site-packages/mori/spdk_proxy \
+UMBP_LOG_LEVEL=0 CASES_OVERRIDE=case3:HBM_DRAM_SSD DUMMY_FORWARD=true \
+DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
+```
+
+## 已知未决
+
+`spdk_proxy` busy-poll + 该机重启后内核 `5.4.241` 在重负载下大面积 soft lockup（kworker 饿死）；
+raw `spdk_nvme_perf` 不触发（写 8.3 / 读 13.6 GB/s 正常）。属环境/内核层问题，需 GPU 空闲时复现深挖。
