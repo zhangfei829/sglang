@@ -1,0 +1,52 @@
+---
+description: 一键信息收集：诊断命令必须 paste-safe、自证机器、只读
+alwaysApply: true
+---
+
+# 一键信息收集（One-Shot Collect）
+
+当需要用户在远程 shell 跑命令收集诊断信息（磁盘/进程/挂载/PCI/日志等），命令必须满足以下约束，否则粘贴到对方终端就会碎、或跨机器混淆。
+
+## Paste-safe（最重要）
+
+用户终端经常把"一条长命令"按渲染换行**拆成多行逐行执行**。所以：
+
+- **每一行都必须是能独立运行的完整命令**。即使被拆开逐行跑，每行也不报错。
+- **禁止** `for ... do ... done`、`if ... fi`、`while`、`$(...)` 命令替换、`( ... )` 子shell、`{ ... }` 组合、here-doc（`<<EOF`）——这些一旦被换行拆开，剩余行就变成 `done: command not found` / `syntax error near unexpected token` 之类的噪声。
+- 多个简单命令用 `;` 串在**真正的一行**里是可以的（前提是不含上面的结构）。但如果命令较多，宁可拆成**多个独立的 fenced bash 代码块，每块一行**，让用户逐块粘。
+- 需要遍历多个对象时，不要 `for`，直接把每个对象写成一行重复命令（例如查 3 个 PCI 就写 3 行 `ls -d /sys/.../<pci>/...`）。
+
+## 自证机器 / 目录
+
+- 命令第一行（或第一块）永远先 `hostname`（必要时加 `pwd`、`git rev-parse --short HEAD`）。多机/多容器环境里，输出必须能自己说明"这是哪台机器、哪个目录、哪个分支"，避免把 A 机的输出当成 B 机的来做决策。
+- 收到的输出若出现**两个不同 prompt / 两台 hostname / 自相矛盾的挂载**，判定为"跨机器混淆"，**立即停止**，不得基于混淆输出执行任何带副作用的操作，要求用户在目标机重新单独跑。
+
+## 只读优先
+
+- 收集阶段一律只读（`lsblk`/`findmnt`/`df`/`ls`/`cat`/`pgrep`/`grep`/`readlink`）。
+- destructive 操作（umount、mdadm --stop、rebind 驱动、rm、kill -9 等）必须**先**用只读命令把事实查清并贴回确认，**再**单独成命令执行。绝不在收集命令里夹带副作用。
+
+## 输出可读
+
+- 段与段之间用简单 `echo` 文本分隔即可，**不要**在 echo 里放 `()`、`[]`、`*` 等会被 shell 解释的字符（否则拆行后 `echo` 没了，那串字符会被当命令报错）。用纯文字标签，例如 `echo ROOT_DEVICE:`。
+
+## 反面示例（粘贴拆行后全是 command not found / syntax error）
+
+```bash
+for n in nvme0 nvme1; do echo "=== $n ==="; lsblk /dev/$n; done; echo "root=$(findmnt -n /)"
+```
+
+## 正面示例（每行独立、自证机器、纯文本标签）
+
+```bash
+hostname
+```
+```bash
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL
+```
+```bash
+findmnt /
+```
+```bash
+ls -d /sys/bus/pci/devices/0000:88:00.0/nvme/*/
+```
