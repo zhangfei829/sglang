@@ -60,12 +60,16 @@ if (( ${#server_logs[@]} == 0 )); then
     log "WARNING: no server.log under $target.  Was the server even launched?"
 else
     for slog in "${server_logs[@]}"; do
-        local_calling=$(grep -c "batch_get_v1: calling UMBP BatchGet" "$slog" 2>/dev/null || echo 0)
-        local_get_done=$(grep -c "batch_get_v1: UMBP BatchGet done" "$slog" 2>/dev/null || echo 0)
-        local_set_calling=$(grep -c "batch_set_v1: calling UMBP BatchPut" "$slog" 2>/dev/null || echo 0)
-        local_set_done=$(grep -c "batch_set_v1: UMBP BatchPut done" "$slog" 2>/dev/null || echo 0)
-        local_iobw=$(grep -c "\[UMBPStore\]\[IOBW\]" "$slog" 2>/dev/null || echo 0)
-        local_bw_token=$(grep -c "bandwidth_gib_s" "$slog" 2>/dev/null || echo 0)
+        # NOTE: `grep -c` already prints "0" on zero matches (and exits 1).
+        # Do NOT append `|| echo 0` or the count becomes "0\n0", which breaks
+        # the `(( ... ))` arithmetic below with a syntax error.  Use :-0 only
+        # to cover the missing-file case where grep prints nothing.
+        local_calling=$(grep -c "batch_get_v1: calling UMBP BatchGet" "$slog" 2>/dev/null); local_calling=${local_calling:-0}
+        local_get_done=$(grep -c "batch_get_v1: UMBP BatchGet done" "$slog" 2>/dev/null); local_get_done=${local_get_done:-0}
+        local_set_calling=$(grep -c "batch_set_v1: calling UMBP BatchPut" "$slog" 2>/dev/null); local_set_calling=${local_set_calling:-0}
+        local_set_done=$(grep -c "batch_set_v1: UMBP BatchPut done" "$slog" 2>/dev/null); local_set_done=${local_set_done:-0}
+        local_iobw=$(grep -c "\[UMBPStore\]\[IOBW\]" "$slog" 2>/dev/null); local_iobw=${local_iobw:-0}
+        local_bw_token=$(grep -c "bandwidth_gib_s" "$slog" 2>/dev/null); local_bw_token=${local_bw_token:-0}
 
         printf "  %s\n" "$slog"
         printf "    batch_get_v1 calling=%-7s done=%-7s\n" "$local_calling" "$local_get_done"

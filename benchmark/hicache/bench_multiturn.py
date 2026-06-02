@@ -165,6 +165,14 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
+    parser.add_argument(
+        "--read-replay",
+        action="store_true",
+        help="After the write run, flush HBM/DRAM (storage tier survives per "
+        "HiRadixCache.reset()) and replay the accumulated prompts so the prefix "
+        "match resolves from the storage backend, forcing storage-tier reads "
+        "(e.g. UMBP BatchGet). Use this to measure SSD read bandwidth.",
+    )
     return parser.parse_args()
 
 
@@ -722,6 +730,60 @@ class WorkloadGenerator:
         return performance_data
 
 
+def run_read_replay(generator, args, flush_cache_url):
+    """Force storage-tier (SSD) reads to measure read bandwidth.
+
+    The write run leaves every prompt's KV in the storage backend (write_through).
+    ``/flush_cache`` -> ``HiRadixCache.reset()`` wipes only the HBM + host (DRAM)
+    index; the storage tier survives and stays reachable via prefetch.  So if we
+    replay the exact prompts after the flush, the prefix match misses HBM/DRAM and
+    resolves from storage, triggering storage-backend reads (UMBP BatchGet).
+    """
+    if args.api_format != "sglang":
+        print("[read-replay] only supported for --api-format sglang; skipping.")
+        return
+
+    # The longest, fully-written prefixes are each client's final history.
+    histories = [
+        list(rec["history"])
+        for rec in generator.client_records.values()
+        if rec.get("history")
+    ]
+    if not histories:
+        print("[read-replay] no histories to replay; skipping.")
+        return
+
+    print(
+        f"\n[read-replay] flushing HBM/DRAM (storage tier survives), then replaying "
+        f"{len(histories)} prompts to force storage reads (BatchGet)..."
+    )
+    requests.post(flush_cache_url)
+    time.sleep(3)
+
+    pbar = tqdm(total=len(histories), desc="read-replay")
+    sem = asyncio.Semaphore(max(1, args.max_parallel))
+
+    async def replay_one(history):
+        payload = gen_payload(history, 1, args.lora_path)
+        async with sem:
+            await generator.request_func(payload, generator.url, pbar)
+
+    async def drive():
+        await asyncio.gather(*(replay_one(h) for h in histories))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(drive())
+    finally:
+        loop.close()
+        pbar.close()
+    print(
+        "[read-replay] done. Look for 'batch_get_v1: UMBP BatchGet done ... "
+        "bandwidth_gib_s' in server.log."
+    )
+
+
 if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
@@ -740,5 +802,8 @@ if __name__ == "__main__":
         args.request_rate = rate
         requests.post(flush_cache_url)
         time.sleep(1)
-        performance_data = WorkloadGenerator(args).run()
+        generator = WorkloadGenerator(args)
+        performance_data = generator.run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
+        if args.read_replay:
+            run_read_replay(generator, args, flush_cache_url)

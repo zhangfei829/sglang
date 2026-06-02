@@ -369,7 +369,14 @@ run_benchmark() {
     local log_file="${case_dir}/bench.log"
     local metrics_file="${case_dir}/performance_metrics.jsonl"
 
-    log "Starting benchmark (rounds=${NUM_ROUNDS}, clients=${NUM_CLIENTS}, max_parallel=${MAX_PARALLEL}, request_length=${REQUEST_LENGTH}, sub_question_input_length=${SUB_QUESTION_INPUT_LENGTH}, output_length=${OUTPUT_LENGTH}, request_rate=${REQUEST_RATE}, timeout ${BENCHMARK_TIMEOUT}s)..."
+    # Optional: force storage-tier (SSD) reads after the write run to measure
+    # read bandwidth (UMBP BatchGet).  Enable with READ_REPLAY=true.
+    local read_replay_args=()
+    if [[ "${READ_REPLAY:-false}" == "true" ]]; then
+        read_replay_args+=("--read-replay")
+    fi
+
+    log "Starting benchmark (rounds=${NUM_ROUNDS}, clients=${NUM_CLIENTS}, max_parallel=${MAX_PARALLEL}, request_length=${REQUEST_LENGTH}, sub_question_input_length=${SUB_QUESTION_INPUT_LENGTH}, output_length=${OUTPUT_LENGTH}, request_rate=${REQUEST_RATE}, read_replay=${READ_REPLAY:-false}, timeout ${BENCHMARK_TIMEOUT}s)..."
     timeout --signal=TERM --kill-after=30 "$BENCHMARK_TIMEOUT" \
         python "${SCRIPT_DIR}/bench_multiturn.py" \
             --model-path "$MODEL_PATH" \
@@ -386,6 +393,7 @@ run_benchmark() {
             --seed "$SEED" \
             --log-file "$metrics_file" \
             --tag "$case_tag" \
+            "${read_replay_args[@]}" \
             2>&1 | tee "$log_file"
     local exit_code=${PIPESTATUS[0]}
     return "$exit_code"

@@ -16,6 +16,19 @@ alwaysApply: true
 - sglang 分支 `test/umbp-io-bandwidth-stats-tools`、模型 `/mnt/nvme1/data/DeepSeekV3.1`。
 - `/etc/ld.so.conf.d/zzz-spdk.conf`（但重启后要重跑 `ldconfig` 刷缓存）。
 
+## skyriver07 模型路径（不要再用 /nfs/data，它重启后会消失）
+
+`/nfs/data/DeepSeek-V3` 是早期 bind mount/软链，**重启后不会自动重建**，跑测会报
+`OSError: Can't load the configuration of '/nfs/data/DeepSeek-V3'`。模型实体在 `/mnt/nvme1/data/`：
+
+| 路径 | 说明 |
+|---|---|
+| `/mnt/nvme1/data/DeepSeekV3.1` | DeepSeek-V3.1，和 V3 架构兼容，**默认用这个** |
+| `/mnt/nvme1/data/deepseek-r1-FP8-Dynamic-from-BF16` | R1 FP8，备用 |
+
+跑测一律显式传 `MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1`，别依赖 runner 里 `/nfs/data` 默认值。
+skyriver07 数据盘：`/mnt/raid0`(14T, md0)、`/mnt/nvme0`(1.6T)、`/mnt/nvme1`(5.9T, 模型在这)。
+
 ## 易丢（重启/容器重启后必做，按此恢复）
 
 | 项 | 检查 | 恢复 |
@@ -38,20 +51,66 @@ alwaysApply: true
 - `not eligible; choose between [0..127]` → 容器 cpuset 被裁到 0-127 → 放开到 0-383。
 - `memory capacity unbalanced ... local_gpu_memory=~1.4GB` → 8 卡被别的任务占满（共享机争用）→ 等 GPU 空闲，别乱杀别人任务。
 - `symmetric_memory.cpp hip failed / Cuda failure invalid argument`（MoE）→ 用 mori main（含 #344 skip RDMA MR when no peers）。
+- **`Memory access fault by GPU node-N on address 0x7f...` + dmesg `PERMISSION_FAULTS:0x5 / VM_L2_PROTECTION_FAULT / UTCL2 client TCP`（prefill 前向时崩）** → hicache 默认 `--hicache-io-backend kernel` 让 GPU kernel 直接读写 host KV 缓冲，skyriver07 上 `hipHostRegister` 对大缓冲不生效 → GPU 越权访问。**修法：加 `--hicache-io-backend direct`（走 hipMemcpyAsync，不让 GPU 解引用 host 指针）。**
+  - bisect 证据：case1(HBM_Only,无 hicache) PASSED；case2(HBM_DRAM,有 hicache 无 UMBP) 也 fault；case3 同样 → 与 mori MoE / UMBP / SPDK 全无关，纯 hicache transfer 问题。
+  - 注意：`kernel` backend 在 banff 能用、skyriver07 不能用 → 机器/ROCm 差异，**skyriver07 必须 direct**。
 
-## 验证过的跑通命令（reuse，不要瞎改参数）
+## 验证过的跑通命令（skyriver07 上 case3 PASSED，reuse，不要瞎改参数）
+
+2026-06-01 在 skyriver07 用下面这条 **case3:HBM_DRAM_SSD PASSED (50s)**，
+133 次 BatchPut，bandwidth min=1.98 / p50=3.18 / max=3.66 / **avg=2.92 GiB/s**。
+关键是 `--hicache-io-backend direct`（无它必 GPU fault）+ `UMBP_SPDK_IO_WORKERS=1`。
 
 ```
-EXTRA_SERVER_ARGS="--mem-fraction-static 0.8 --max-total-tokens 600000" \
+EXTRA_SERVER_ARGS="--mem-fraction-static 0.8 --max-total-tokens 600000 --hicache-io-backend direct" \
 HICACHE_SIZE=128 SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384 \
 MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1 UMBP_SSD_BACKEND=spdk_proxy \
 UMBP_SPDK_NVME_PCI=0000:88:00.0 \
 UMBP_SPDK_PROXY_BIN=/opt/venv/lib/python3.10/site-packages/mori/spdk_proxy \
+UMBP_SPDK_IO_WORKERS=1 \
 UMBP_LOG_LEVEL=0 CASES_OVERRIDE=case3:HBM_DRAM_SSD DUMMY_FORWARD=true \
 DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 ```
 
-## 已知未决
+- `BatchGet=0` 是正常的：fresh cache 全写无读，要测读带宽需触发 prefix 命中（多轮重复 prompt）。
+- soft lockup 在 skyriver07 上即使 case1（无 SPDK）也会涨，是该机 GPU/kfd 层噪声，**不致命、不阻断 run**，别再归因到 SPDK io_workers。
 
-`spdk_proxy` busy-poll + 该机重启后内核 `5.4.241` 在重负载下大面积 soft lockup（kworker 饿死）；
-raw `spdk_nvme_perf` 不触发（写 8.3 / 读 13.6 GB/s 正常）。属环境/内核层问题，需 GPU 空闲时复现深挖。
+## 问题与成果记录（2026-06-01 skyriver07）
+
+### 成果（目标达成）
+- **skyriver07 全栈 case3:HBM_DRAM_SSD PASSED**（DP8 + mori MoE + UMBP + spdk_proxy + SSD）。
+- IO 写带宽 telemetry 真实采到：
+  - 06-01 首次：133 次 BatchPut，avg 2.92 GiB/s。
+  - **06-02 重启后干净复现：138 次 BatchPut，avg 3.445 / p50 3.475 / p95 3.671 / max 3.675 GiB/s**（14.36 GB，典型 batch 137.25 MiB，per-call 中位 36.5ms）。
+- 8 个 DP rank 的 `[UMBPStore][IOBW]` 日志 + JSONL 旁路文件全部产出。
+- **JSONL 旁路确认有效**：06-02 diagnose 自动重算出 8 files / 138 call records / avg 3.445。
+  （06-01 那次报"0 records"是采集时机问题——手动跑 summarizer 时 runner 还没把 JSONL 移进结果目录，**不是 bug**。）
+- banff 5/29 也 PASSED 过（avg 1.405 GiB/s，不同机器/参数）。
+
+### 重启后恢复流程（06-02 验证有效，照此顺序）
+1. host: rebind `0000:88:00.0`（=nvme2/nvme2n1，7T 未挂载空盘，**先确认未挂载再 rebind**）：
+   `echo 0000:88:00.0 > /sys/bus/pci/drivers/nvme/unbind; echo vfio-pci > .../driver_override; echo 0000:88:00.0 > /sys/bus/pci/drivers/vfio-pci/bind`
+2. host: hugepage `echo 24576 > node{0,1}/.../nr_hugepages`（共 49152，全 free）。
+3. 读 iommu group：`basename $(readlink .../0000:88:00.0/iommu_group)` = **110**，`cat /sys/class/vfio/110/dev` = **239:0**。
+4. 容器内：`mknod -m666 /dev/vfio/110 c 239 0`；`mkdir -p /dev/hugepages; mount -t hugetlbfs nodev /dev/hugepages`。
+5. 清残留：`rm -f /var/tmp/spdk_cpu_lock_* /var/tmp/spdk.sock* /dev/hugepages/umbp_spdk_proxy`。
+6. 复检全绿后直接跑下面"验证过的命令"。
+
+### 排障时间线（每一步都 bisect 验证，非臆断）
+1. `OSError: Can't load config /nfs/data/DeepSeek-V3` → `/nfs/data` 重启消失 → 改 `MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1`。
+2. proxy attach 崩 → PCI 用错（`0000:50:00.0` 是 banff 的）→ skyriver07 用 `0000:88:00.0`。
+3. `EOFError` scheduler init → 用对 PCI + verified config 后消失。
+4. **`Memory access fault by GPU`（prefill 前向）→ 真正的大坑**：bisect 出 case1(无 hicache)PASSED、case2/3(有 hicache)fault → 根因是 `--hicache-io-backend kernel` 默认值，skyriver07 上 GPU 直访 host 缓冲越权 → **改 `--hicache-io-backend direct` 修复**。
+5. 全部叠加后 PASSED。
+
+### 仍未决：soft lockup（不阻塞，但要查）
+- 现象：`watchdog: BUG: soft lockup - CPU#N stuck 22s [kworker/N]`，重负载下大面积，跨多核。
+- **重要修正**：原以为是 `spdk_proxy` busy-poll（`spdk_ssd_tier.cpp:544` 无 `CPU_PAUSE` 的 drain 忙等 + 不绑核 worker 线程）独占造成。但 **case1（无 SPDK/UMBP）跑通时 soft lockup 计数照样涨**（78→88），证明**不只是 SPDK** —— 这台机器的 GPU/amdgpu/kfd 活动（含 faulted context 的 `kfd_process_wq_release` 清理）本身就触发。
+- `UMBP_SPDK_IO_WORKERS=1` 仍建议保留（减少不绑核忙等线程，降低 SPDK 那部分贡献），但它**不是 soft lockup 的完整解**。
+- 现状：soft lockup **不致命、不阻断 run**（case3 PASSED 时也在涨）。属内核/驱动层（kernel 5.4.241 + ROCm）问题。
+- 待深挖方向：(a) `spdk_ssd_tier.cpp:544` drain 加 `CPU_PAUSE` + worker 绑核（降 SPDK 贡献）；(b) 查 amdgpu/kfd 在大 free/IPC 时的 kworker 卡顿；(c) 对比 banff（同负载不触发？）定位是否纯 skyriver07 内核版本问题。
+
+### 其它遗留
+- `BatchGet=0`：fresh cache 全写无读，测读带宽需触发 prefix 命中（多轮重复 prompt）。**仍未做。**
+- ~~`summarize_iobw_jsonl.py` 报 0 records~~ → **已澄清非 bug**（采集时机问题，06-02 自动重算 138 records 正常）。
+- ~~`diagnose_iobw_logs.sh` 多行计数语法错~~ → **已修**（`grep -c || echo 0` 会产生 `0\n0`，去掉 `|| echo 0` 改用 `${var:-0}`）。
