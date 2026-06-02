@@ -1,6 +1,7 @@
 import abc
 import logging
 import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -882,6 +883,18 @@ class MLATokenToKVPoolHost(HostKVCache):
             "False",
         )
         if _load_timing:
+            # Unconditional "function reached" marker (stderr, bypasses any log
+            # level filtering) so we can tell "load_to_device_per_layer never
+            # called" apart from "called but log filtered".  Printed once.
+            if not getattr(MLATokenToKVPoolHost, "_hicache_load_entered", False):
+                MLATokenToKVPoolHost._hicache_load_entered = True
+                print(
+                    f"[HICACHE-LOAD] ENTER load_to_device_per_layer "
+                    f"io_backend={io_backend} layout={self.layout} "
+                    f"layer_num={self.layer_num} pid={os.getpid()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             torch.cuda.synchronize()
             _load_t0 = time.perf_counter()
         if io_backend == "kernel":
@@ -959,13 +972,17 @@ class MLATokenToKVPoolHost(HostKVCache):
             except Exception:
                 _nbytes = 0
             if _nbytes > 0 and _load_dt > 0:
-                logging.getLogger(__name__).info(
-                    "[HICACHE-LOAD] layer=%d tokens=%d bytes=%d dt_ms=%.3f GiB/s=%.2f",
-                    layer_id,
-                    int(_n),
-                    _nbytes,
-                    _load_dt * 1000.0,
-                    _nbytes / _load_dt / (1024.0**3),
+                print(
+                    "[HICACHE-LOAD] layer=%d tokens=%d bytes=%d dt_ms=%.3f GiB/s=%.2f"
+                    % (
+                        layer_id,
+                        int(_n),
+                        _nbytes,
+                        _load_dt * 1000.0,
+                        _nbytes / _load_dt / (1024.0**3),
+                    ),
+                    file=sys.stderr,
+                    flush=True,
                 )
 
     def backup_from_device_all_layer(
