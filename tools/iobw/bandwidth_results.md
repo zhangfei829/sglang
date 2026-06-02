@@ -28,5 +28,22 @@
 - RAID0 写 1.6×、读 ~2× 真扩展（裸盘精确 2×；tier 层因 pipeline 开销略低）。
 - `--hicache-io-backend direct` 必加（kernel backend 在 skyriver07 GPU permission fault）。
 
-## 待测
-- **per-layer DRAM→HBM load 带宽**（hicache host→device KV 传输，`memory_pool_host.load_to_device_per_layer`）。
+## DRAM→HBM load 带宽（host→device 链路，bench_dram_to_hbm.py）
+
+| transfer | DRAM→HBM |
+|---|---|
+| 72 KiB（1 page/layer） | 0.44 GiB/s（延迟受限） |
+| 4.5 MiB（64 pages） | 26.75 GiB/s |
+| 18 MiB（256 pages） | 39.43 GiB/s |
+| 128 MiB+（饱和） | **53.5 GiB/s ≈ 57.5 GB/s**（PCIe Gen5 x16 量级） |
+
+## 架构结论：SSD 能否取代 DRAM 喂 HBM？
+
+| 路径 | 带宽 |
+|---|---|
+| DRAM→HBM 饱和 | 57.5 GB/s |
+| DRAM→HBM 实际 per-layer（多页 4.5-18MiB） | 27-39 GB/s |
+| SSD load（RAID0 2 盘） | 13.56 GB/s (raw) / 9.36 (tier) |
+
+**DRAM→HBM 比 SSD load 快 2-4×** → **当前 2 盘 RAID0 的 SSD 不能透明取代 DRAM**：用 SSD 当源会把 load 卡在 ~13.6 GB/s（DRAM 能 27-57）。
+要让 SSD 追平：需 **4 盘 RAID0（~27 GB/s，追平实际 per-layer DRAM 速率）甚至 6-8 盘（追平饱和 57）**；或 workload per-layer 传输都很小（DRAM 也降到 0.4-27，差距缩小）。
