@@ -1,0 +1,35 @@
+---
+description: 查长任务/benchmark 进展时用 tail -F 直接跟日志，不要用一次性 grep 快照
+alwaysApply: true
+---
+
+# 监控长任务进展：用 `tail -F`，不要 grep 快照
+
+## 规则
+
+1. 长任务（benchmark、编译、server 启动）必须 `tee` 到固定日志文件，例如
+   `... 2>&1 | tee /tmp/<task>.log`，这样进展可被 `tail -F` 跟踪。
+2. **查进展默认用 `tail -n 50 -F <logfile>`** 直接跟日志尾部，让用户看到实时滚动输出。
+3. **不要**用 `cmd | grep ...` 这种管道做"实时"监控——`grep`/`tee` 经管道会**行缓冲**，
+   在数据生成阶段（如 64GB 造数据、模型加载）长时间**不输出**，看起来像卡死，其实在跑。
+   （已踩坑：`bench_umbp_micro ... | tee log | grep` 半天没输出被误判卡住，实际在造数据。）
+4. 一次性快照命令（`grep -c`、`awk` 汇总）只用在**任务已结束后**算最终结果，不用于"看进展"。
+5. 若必须过滤实时流，用 `tail -F log | grep --line-buffered -E ...`（`--line-buffered` 关掉缓冲），
+   但优先直接 `tail -F` 看全量。
+
+## 给用户的命令模板
+
+**本项目 hicache bench 查进展的默认命令（直接用这条，别再换花样）：**
+
+```bash
+RDIR=$(ls -1dt /sgl-workspace/sglang/benchmark/hicache/results/tiered_cache_bench_dp8ep8/*/|head -1); tail -n 40 -F "$RDIR"/case3_*/server.log
+```
+
+其它场景：
+
+```bash
+# 跟 tee 的 run 日志
+tail -n 50 -F /tmp/<task>.log
+```
+
+要点：**进展看 `tail -F`，结果用一次性汇总**。两者别混用。

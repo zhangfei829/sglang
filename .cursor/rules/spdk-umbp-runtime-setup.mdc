@@ -75,6 +75,34 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - `BatchGet=0` 是正常的：fresh cache 全写无读，要测读带宽需触发 prefix 命中（多轮重复 prompt）。
 - soft lockup 在 skyriver07 上即使 case1（无 SPDK）也会涨，是该机 GPU/kfd 层噪声，**不致命、不阻断 run**，别再归因到 SPDK io_workers。
 
+## 测 DRAM→HBM 逐层 load 带宽（host pool L2 → device pool L1）
+
+- **路径（已 trace 确认，唯一）**：`cache_controller.py:start_loading` 逐层调
+  `mem_pool_host.load_to_device_per_layer(...)`。**没有别的 host→device load 旁路**；
+  `*_all_layer` 全是 `backup_from_device_all_layer`（写回 device→host），别搞混。
+- **micro bench（`bench_umbp_micro` / `run_umbp_iobw_test.sh` 直调 UMBPStore）不过 controller，
+  永远测不到这个**——必须跑全栈 server（`--enable-hierarchical-cache`，即 case2/case3）。
+- 埋点：`MLATokenToKVPoolHost.load_to_device_per_layer`，开关 `SGLANG_HICACHE_LOAD_TIMING=1`。
+  首次进入打 `[HICACHE-LOAD] ENTER ...`（stderr，证明被调到），之后每层打
+  `[HICACHE-LOAD] layer=.. tokens=.. GiB/s=..`。**stderr 直出，不受 log level 过滤**。
+- 触发条件：要有 device(HBM) 驱逐 + prefix 复用 → 多轮重复 prompt（`READ_REPLAY=true` 最稳）。
+- **跑通命令（在上面验证过的 case3 命令基础上加两个开关，case2 也行但同样要 `--hicache-io-backend direct`）**：
+
+```
+SGLANG_HICACHE_LOAD_TIMING=1 READ_REPLAY=true \
+EXTRA_SERVER_ARGS="--mem-fraction-static 0.8 --max-total-tokens 600000 --hicache-io-backend direct" \
+HICACHE_SIZE=128 SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384 \
+MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1 UMBP_SSD_BACKEND=spdk_proxy \
+UMBP_SPDK_NVME_PCI=0000:88:00.0 \
+UMBP_SPDK_PROXY_BIN=/opt/venv/lib/python3.10/site-packages/mori/spdk_proxy \
+UMBP_SPDK_IO_WORKERS=1 UMBP_LOG_LEVEL=0 \
+CASES_OVERRIDE=case3:HBM_DRAM_SSD DUMMY_FORWARD=true \
+DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
+```
+
+- io_backend=`direct` 时 load 走 `transfer_kv_direct` / `transfer_kv_per_layer_direct_pf_lf`
+  分支（埋点已覆盖）；`kernel` 在 skyriver07 会 GPU fault，**必须 direct**。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
@@ -82,9 +110,10 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - IO 写带宽 telemetry 真实采到：
   - 06-01 首次：133 次 BatchPut，avg 2.92 GiB/s。
   - **06-02 重启后干净复现：138 次 BatchPut，avg 3.445 / p50 3.475 / p95 3.671 / max 3.675 GiB/s**（14.36 GB，典型 batch 137.25 MiB，per-call 中位 36.5ms）。
-- **06-02 读带宽也测到了**（`READ_REPLAY=true` 新模式）：BatchGet **avg 16.27 / p50 16.26 / p95 16.45 / max 16.47 GiB/s**（549 MiB/call，32.5ms）。读远快于写，符合 NVMe（raw perf 读 13.6 GB/s）。
+- **06-02 BatchGet 读路径打通**（`READ_REPLAY=true` 新模式）：能触发 SSD 读、telemetry 有数。
   - 机制：写阶段 write_through 落 SSD → `/flush_cache`（`HiRadixCache.reset()` 只清 HBM/DRAM，**storage 存活且 prefetch 可达**）→ 重放同样 prompts → 命中 storage → BatchGet。
-  - 开关：`READ_REPLAY=true`（bench_multiturn `--read-replay`）。写不依赖逐出，HICACHE_SIZE 用 128 即可。
+  - 开关：`READ_REPLAY=true`（bench_multiturn `--read-replay`）。
+  - **⚠️ 所有读带宽数字到目前为止都不可信（cache 命中）**。见下方「读带宽」专节。
 - 8 个 DP rank 的 `[UMBPStore][IOBW]` 日志 + JSONL 旁路文件全部产出。
 - **JSONL 旁路确认有效**：06-02 diagnose 自动重算出 8 files / 138 call records / avg 3.445。
   （06-01 那次报"0 records"是采集时机问题——手动跑 summarizer 时 runner 还没把 JSONL 移进结果目录，**不是 bug**。）
@@ -113,7 +142,42 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - 现状：soft lockup **不致命、不阻断 run**（case3 PASSED 时也在涨）。属内核/驱动层（kernel 5.4.241 + ROCm）问题。
 - 待深挖方向：(a) `spdk_ssd_tier.cpp:544` drain 加 `CPU_PAUSE` + worker 绑核（降 SPDK 贡献）；(b) 查 amdgpu/kfd 在大 free/IPC 时的 kworker 卡顿；(c) 对比 banff（同负载不触发？）定位是否纯 skyriver07 内核版本问题。
 
+### 带宽实测结论（skyriver07，06-02，apples-to-apples，bench_umbp_micro --profile large io_workers=4）
+
+硬件（已用 sysfs 硬数据确认）：盘 = Samsung PM9A3 级 [144d:a80a]，7.68TB，**PCIe Gen4 x4（current_link_speed=16 GT/s, width=4）**。
+PCIe Gen4 x4 物理上限 = 16×4×(128/130)/8 ≈ **7.88 GB/s/盘**（链路硬顶，NAND 再快也过不去）。RAID0=2 盘聚合上限 ≈ 15.76 GB/s。
+**任何单盘读 > 7.88 GB/s 一律是 cache，没有例外。**
+
+**可信结论（64 GiB 工作集冷读，bench_umbp_micro --value-size 4MiB --num-keys 16384 --batch-size 16 io_workers=4，全部过 PCIe sanity check）：**
+| | 单盘(88) | RAID0(88+c3) | 倍数 |
+|---|---|---|---|
+| SSD WriteBatch | 3.25 GiB/s (3.49 GB/s) | 5.21 GiB/s (5.59 GB/s) | **1.60×** |
+| SSD ReadBatch | 4.91 GiB/s (5.27 GB/s) | 8.72 GiB/s (9.36 GB/s) | **1.78×** |
+
+- **RAID0 读写都真有效**（写 1.60×、读 1.78×，真双盘条带）。
+- 铁证：RAID0 读 9.36 GB/s **> 单盘 PCIe 上限 7.88 GB/s**，单盘物理不可能 → 确实条带到两块盘。
+- 所有数 < 双盘聚合上限 15.76 GB/s ✅。
+
+**小工作集（几百 MB，如 --profile large 默认）读出来的 14~16 GiB/s 全是 SSD 控制器 DRAM cache，作废。** 测真带宽必须工作集 >> 控制器 DRAM（≥ 64GB 稳妥）冷读。proxy 路径之前的 16 GiB/s 同理（proxy ring cache）。
+
+**RAW 裸盘上限（bdevperf 直打 bdev，1MiB io，qd256，绕开 tier pipeline）：**
+| | 单盘(88) | RAID0(88+c3) | 倍数 |
+|---|---|---|---|
+| RAW 读 | 6.75 GB/s | 13.56 GB/s | **2.01×** |
+| RAW 写 | 4.17 GB/s | 8.30 GB/s | **1.99×** |
+
+- 验证：单盘 RAW 读 6.75 ≈ PM9A3 标称 ~6.8、写 4.17 ≈ 标称 ~4.1 GB/s，吻合 → 可信。RAID0 精确 2× 条带。
+- **层级损耗**：RAW → SpdkSsdTier batch（读 9.36/写 5.59 GB/s）损 ~20-33%（memcpy+submit+drain）→ proxy 路径再往下。
+- bdevperf：`bdevperf -c <json> -s 4096 -m 0xFF -q 256 -o 1048576 -t 15 -w read|write -T Raid0|NVMe0n1`；JSON 用 bdev_nvme_attach_controller(×2) + bdev_raid_create(raid0, strip 128KB)。
+
+### 全栈 proxy 写瓶颈（06-02 定位，代码+历史双证）
+
+全栈 case3 写带宽 **3.43 GiB/s**，io_workers 1→4 **无变化**，RAID0 也吃不进去（≈单盘 tier 写 3.49）。
+- **根因**：`spdk_proxy_tier.cpp:487` client 端把 KV 灌进共享 ring 是**单线程 memcpy**（pinned host→hugetlb shm，~3.43 GB/s）。proxy 被 `bytes_ready` 门控（`spdk_proxy_daemon.cpp:796` / `spdk_ssd_tier.cpp:669`），流水线速率 = min(单线程 memcpy, SSD 写)。单盘时两者相当；RAID0(5.59~8.3) 快过 memcpy → **memcpy 成瓶颈**，proxy 被饿着，故 RAID0/io_workers 无效。
+- **历史**：`git log -S` 确认 `bytes_ready`/`kCopyChunk`/`BatchWriteStreaming` 均 **#213(2026-03-23 首版 SPDK 后端)引入**；#223(多租户重构) 沿用未改。→ **原始设计，非 regression**；#213 按单盘设计，没考虑 RAID0 这种快后端。
+- **修法（已改，opt-in）**：`spdk_proxy_tier.cpp` 加 `UMBP_SPDK_PROXY_COPY_THREADS`（默认 1=原行为零风险），>1 时并行 memcpy 灌 ring、`bytes_ready` 末尾一次性发布。需重编 mori 验证写带宽能否从 3.43 升向 ~5.59。
+
 ### 其它遗留
-- ~~`BatchGet=0` 测不到读带宽~~ → **已解决**：`READ_REPLAY=true`（写→flush→重放）06-02 测到 BatchGet avg 16.27 GiB/s。普通 multiturn 测不到是因为热 prefix 一直留 HBM，从不逐出再访问。
+- ~~`BatchGet=0` 测不到读带宽~~ → **已解决**：`READ_REPLAY=true`（写→flush→重放）可触发 SSD 读。注意小工作集下读数是 cache（见上）。
 - ~~`summarize_iobw_jsonl.py` 报 0 records~~ → **已澄清非 bug**（采集时机问题，06-02 自动重算 138 records 正常）。
 - ~~`diagnose_iobw_logs.sh` 多行计数语法错~~ → **已修**（`grep -c || echo 0` 会产生 `0\n0`，去掉 `|| echo 0` 改用 `${var:-0}`）。
