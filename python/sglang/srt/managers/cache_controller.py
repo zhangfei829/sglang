@@ -831,6 +831,17 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
+        if not getattr(HiCacheController, "_hicache_start_loading_seen", False):
+            HiCacheController._hicache_start_loading_seen = True
+            import sys as _sys
+
+            print(
+                f"[HICACHE-LOAD] start_loading called: queue={len(self.load_queue)} "
+                f"layer_num={self.layer_num} io_backend={self.io_backend}",
+                file=_sys.stderr,
+                flush=True,
+            )
+
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(op)

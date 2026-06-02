@@ -882,19 +882,21 @@ class MLATokenToKVPoolHost(HostKVCache):
             "false",
             "False",
         )
+        # UNCONDITIONAL "function reached" marker (stderr, bypasses log filtering
+        # AND the timing env gate) so ENTER=0 unambiguously means "never called",
+        # not "env didn't propagate".  Printed once.  Also reports whether the
+        # timing env was seen by THIS process.
+        if not getattr(MLATokenToKVPoolHost, "_hicache_load_entered", False):
+            MLATokenToKVPoolHost._hicache_load_entered = True
+            print(
+                f"[HICACHE-LOAD] ENTER load_to_device_per_layer "
+                f"io_backend={io_backend} layout={self.layout} "
+                f"layer_num={self.layer_num} pid={os.getpid()} "
+                f"timing_env={_load_timing}",
+                file=sys.stderr,
+                flush=True,
+            )
         if _load_timing:
-            # Unconditional "function reached" marker (stderr, bypasses any log
-            # level filtering) so we can tell "load_to_device_per_layer never
-            # called" apart from "called but log filtered".  Printed once.
-            if not getattr(MLATokenToKVPoolHost, "_hicache_load_entered", False):
-                MLATokenToKVPoolHost._hicache_load_entered = True
-                print(
-                    f"[HICACHE-LOAD] ENTER load_to_device_per_layer "
-                    f"io_backend={io_backend} layout={self.layout} "
-                    f"layer_num={self.layer_num} pid={os.getpid()}",
-                    file=sys.stderr,
-                    flush=True,
-                )
             torch.cuda.synchronize()
             _load_t0 = time.perf_counter()
         if io_backend == "kernel":
