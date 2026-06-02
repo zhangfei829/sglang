@@ -82,6 +82,9 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - IO 写带宽 telemetry 真实采到：
   - 06-01 首次：133 次 BatchPut，avg 2.92 GiB/s。
   - **06-02 重启后干净复现：138 次 BatchPut，avg 3.445 / p50 3.475 / p95 3.671 / max 3.675 GiB/s**（14.36 GB，典型 batch 137.25 MiB，per-call 中位 36.5ms）。
+- **06-02 读带宽也测到了**（`READ_REPLAY=true` 新模式）：BatchGet **avg 16.27 / p50 16.26 / p95 16.45 / max 16.47 GiB/s**（549 MiB/call，32.5ms）。读远快于写，符合 NVMe（raw perf 读 13.6 GB/s）。
+  - 机制：写阶段 write_through 落 SSD → `/flush_cache`（`HiRadixCache.reset()` 只清 HBM/DRAM，**storage 存活且 prefetch 可达**）→ 重放同样 prompts → 命中 storage → BatchGet。
+  - 开关：`READ_REPLAY=true`（bench_multiturn `--read-replay`）。写不依赖逐出，HICACHE_SIZE 用 128 即可。
 - 8 个 DP rank 的 `[UMBPStore][IOBW]` 日志 + JSONL 旁路文件全部产出。
 - **JSONL 旁路确认有效**：06-02 diagnose 自动重算出 8 files / 138 call records / avg 3.445。
   （06-01 那次报"0 records"是采集时机问题——手动跑 summarizer 时 runner 还没把 JSONL 移进结果目录，**不是 bug**。）
@@ -111,6 +114,6 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - 待深挖方向：(a) `spdk_ssd_tier.cpp:544` drain 加 `CPU_PAUSE` + worker 绑核（降 SPDK 贡献）；(b) 查 amdgpu/kfd 在大 free/IPC 时的 kworker 卡顿；(c) 对比 banff（同负载不触发？）定位是否纯 skyriver07 内核版本问题。
 
 ### 其它遗留
-- `BatchGet=0`：fresh cache 全写无读，测读带宽需触发 prefix 命中（多轮重复 prompt）。**仍未做。**
+- ~~`BatchGet=0` 测不到读带宽~~ → **已解决**：`READ_REPLAY=true`（写→flush→重放）06-02 测到 BatchGet avg 16.27 GiB/s。普通 multiturn 测不到是因为热 prefix 一直留 HBM，从不逐出再访问。
 - ~~`summarize_iobw_jsonl.py` 报 0 records~~ → **已澄清非 bug**（采集时机问题，06-02 自动重算 138 records 正常）。
 - ~~`diagnose_iobw_logs.sh` 多行计数语法错~~ → **已修**（`grep -c || echo 0` 会产生 `0\n0`，去掉 `|| echo 0` 改用 `${var:-0}`）。

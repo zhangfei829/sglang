@@ -64,6 +64,7 @@ declare -a DIRTY_IGNORE_PATHS=(
     "tools/iobw/README.md"
     "umbp_iobw_logs/"
     "run_umbp_iobw_test.sh"
+    "gpucore."
 )
 
 is_path_ignored_for_dirty() {
