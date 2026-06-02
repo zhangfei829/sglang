@@ -1,6 +1,8 @@
 import abc
 import logging
+import os
 import threading
+import time
 from collections import defaultdict
 from functools import wraps
 from typing import Optional
@@ -869,6 +871,19 @@ class MLATokenToKVPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        # SGLANG_HICACHE_LOAD_TIMING=1: measure the REAL per-layer DRAM->HBM load
+        # bandwidth (includes the gather-by-index + per-layer kernel overhead, not
+        # just a flat memcpy).  Synchronizes around the transfer so the number is
+        # the effective per-layer load rate.
+        _load_timing = os.environ.get("SGLANG_HICACHE_LOAD_TIMING", "") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        if _load_timing:
+            torch.cuda.synchronize()
+            _load_t0 = time.perf_counter()
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -930,6 +945,28 @@ class MLATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        if _load_timing:
+            torch.cuda.synchronize()
+            _load_dt = time.perf_counter() - _load_t0
+            try:
+                _n = (
+                    device_indices.numel()
+                    if hasattr(device_indices, "numel")
+                    else len(device_indices)
+                )
+                _nbytes = int(_n) * int(self.token_stride_size)
+            except Exception:
+                _nbytes = 0
+            if _nbytes > 0 and _load_dt > 0:
+                logging.getLogger(__name__).info(
+                    "[HICACHE-LOAD] layer=%d tokens=%d bytes=%d dt_ms=%.3f GiB/s=%.2f",
+                    layer_id,
+                    int(_n),
+                    _nbytes,
+                    _load_dt * 1000.0,
+                    _nbytes / _load_dt / (1024.0**3),
+                )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
