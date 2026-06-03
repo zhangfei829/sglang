@@ -849,8 +849,25 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        # SGLANG_HICACHE_LOAD_AGG=1: time the WHOLE (all-layer) host->device load
+        # with a single sync around the loop (no per-layer sync), so the number is
+        # the un-contaminated effective DRAM->HBM load bandwidth.  Keep
+        # SGLANG_HICACHE_LOAD_TIMING OFF when using this to avoid per-layer syncs.
+        _agg_timing = os.environ.get("SGLANG_HICACHE_LOAD_AGG", "") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        _agg_start = _agg_end = None
+        if _agg_timing:
+            _agg_start = device_module.Event(enable_timing=True)
+            _agg_end = device_module.Event(enable_timing=True)
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if _agg_timing:
+                _agg_start.record(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -860,6 +877,8 @@ class HiCacheController:
                     self.io_backend,
                 )
                 producer_event.complete(i)
+            if _agg_timing:
+                _agg_end.record(self.load_stream)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -867,6 +886,29 @@ class HiCacheController:
                 host_indices.record_stream(self.load_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.load_stream)
+
+        if _agg_timing:
+            _agg_end.synchronize()
+            _dt_ms = _agg_start.elapsed_time(_agg_end)
+            _tok = len(device_indices)
+            _stride = getattr(self.mem_pool_host, "token_stride_size", 0) or 0
+            _nbytes = int(_tok) * int(_stride) * int(self.layer_num)
+            if _nbytes > 0 and _dt_ms > 0:
+                import sys as _sys
+
+                print(
+                    "[HICACHE-LOAD-AGG] tokens=%d layers=%d bytes=%d dt_ms=%.3f "
+                    "GiB/s=%.2f (effective all-layer DRAM->HBM, single sync)"
+                    % (
+                        int(_tok),
+                        int(self.layer_num),
+                        _nbytes,
+                        _dt_ms,
+                        _nbytes / (_dt_ms / 1000.0) / (1024.0**3),
+                    ),
+                    file=_sys.stderr,
+                    flush=True,
+                )
 
         self.ack_load_queue.append(
             HiCacheAck(
