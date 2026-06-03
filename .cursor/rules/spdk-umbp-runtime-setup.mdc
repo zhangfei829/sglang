@@ -186,6 +186,27 @@ DRAM tier 读直走 `DramTier` 内存（不经 proxy ring）；只有 SSD tier �
 **结论：6.0 不是 DRAM→HBM 硬件极限，是 "AMD 上 kernel 崩 + direct 无批量/无合并逐页拷" 的软件路径天花板。** 正常机（kernel 可用 / CUDA 12.8+ 批量）会快得多。
 **修复方向**：① 修 kernel backend 的 ROCm GPU fault（hipHostRegister 大缓冲不生效）= 拿到融合 gather 快路径（最优）；② 给 page_first_direct fallback 加连续页合并（中等）；③ GDS 直 DMA 绕开 host 中转+散列 gather（根治）。
 
+### kernel backend ROCm GPU-fault 根因 + 修法（06-03 定位，已写代码待 CI 重编）
+
+**根因**：skyriver07 = ROCm7.0 + 内核5.4.241 + **XNACK=NO**（ISA `xnack-`、`noretry=-1`）+ 无 CUDA UVA 等价。
+GPU **无法解引用 host 虚拟地址**（任何 `cudaHostRegister` flag、任何大小都 `Memory access fault by GPU node-N`）。
+- 独立 HIP 探测 `tools/iobw/test_host_register.hip`（`run_host_register_probe.sh`）铁证：
+  **hostptr 全崩；`hipHostGetDevicePointer` 的 devptr 全成功，64GB 也行、无 BAR 上限**（flags 0/2/3 都可）。
+- 为何只有这台：CUDA 有 UVA（host pinned ptr==dev ptr）；XNACK-on 的 ROCm（疑似 banff）靠 page-fault 迁移也能用 host VA；
+  唯独 **XNACK-off + 无 UVA** 这台崩。上游按 UVA 写，碰不到。XNACK 要开得 reboot(`amdgpu.noretry=0`)+ 全量 xnack+ 重编，比改代码重，且慢（迁移）→ 放弃。
+
+**已写的修复（commit 在 test/umbp-io-bandwidth-stats-tools）**：
+1. `sgl-kernel/csrc/kvcacheio/transfer.cu`：`transfer_kv_launcher` 加 `hicache_device_accessible_ptr()`，
+   对 CPU(host) tensor 用 `cudaHostGetDevicePointer`(hipify→hipHostGetDevicePointer)翻译成设备指针（`#if USE_ROCM`），
+   CUDA 上 no-op。覆盖 per-layer load 路径（`transfer_kv_per_layer_mla_pf_lf`）。
+2. `python/.../memory_pool_host.py`：`host_to_device_accessible_ptr()`（ctypes 调 hipHostGetDevicePointer），
+   建 MLA `data_ptrs` 表时翻译每个 host 指针 → 覆盖 all-layer backup 路径。env `SGLANG_HICACHE_KERNEL_DEVPTR`(默认开)。
+
+**重编注意（关键，别再手动踩坑）**：sgl_kernel 是预编译 egg(0.3.21)，本机 `pip install -e .` 走 scikit-build/`CMakeLists_rocm.txt`，
+该 CMakeLists **要预生成的 `csrc/*.hip`**，而 `3rdparty/amd/sgl-kernel/rocm_hipify.py`(41行)**只定义 ext_modules、不真 hipify** →
+手动 build 报 `Cannot find source file: quick_all_reduce.hip`。**正确路：走 `3rdparty/amd/sgl-kernel/build_rocm.sh` 的 docker 镜像构建**（CI 内有完整 hipify），别在 skyriver07 手动 `pip install -e .`。
+- 还原手动 build 残留：`cp /tmp/CMakeLists.cuda.bak CMakeLists.txt; rm -f rocm_hipify.py rename_wheels_rocm.sh; git checkout -- .`。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
