@@ -103,6 +103,40 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - io_backend=`direct` 时 load 走 `transfer_kv_direct` / `transfer_kv_per_layer_direct_pf_lf`
   分支（埋点已覆盖）；`kernel` 在 skyriver07 会 GPU fault，**必须 direct**。
 
+### ⚠️ 触发 host→device load 的必要条件（否则埋点永不打）
+
+`load_to_device_per_layer` 只在 `req.host_hit_length > 0` 时触发
+（`schedule_policy.py:792` → `init_load_back` → `cache_controller.load()` + `start_loading()`）。
+即**前缀必须先从 L1(HBM) 驱逐到 L2(host DRAM)，再次复用命中 L2 才会 load 回 device**。
+- `--max-total-tokens` 太大 → L1 装得下全部前缀、永不驱逐 → `host_hit_length=0` → load 从不触发。
+- **必须把 L1 压小**逼驱逐：`--max-total-tokens 60000` + 多客户端多轮复用（`NUM_CLIENTS=16 NUM_ROUNDS=20`）。
+- case3 的 READ_REPLAY 走的是 storage→host **异步 prefetch**，dummy 重算太快、请求在 prefetch 落地前就完事 → 同样测不到 host→device load。**测 DRAM→HBM 要用 case2 + 小 L1，不是 case3 replay。**
+- `dummy_forward` 不影响 load（load_back 在 scheduler 里、forward 之前，只看 host_hit_length），可继续用 dummy 省 compute。
+
+### 实测结果（skyriver07，06-03，DeepSeekV3.1，case2，direct，page_first_direct）
+
+| 测法 | 带宽 | 说明 |
+|---|---|---|
+| 逐层（`SGLANG_HICACHE_LOAD_TIMING=1`，每层 sync） | p50 5.71 / avg 5.53 GiB/s，大 token 封顶 ~5.8 | n=3355，小 token(64) 仅 1.6（sync 主导） |
+| **整次 61 层（`SGLANG_HICACHE_LOAD_AGG=1`，单 sync）** | **avg 5.96 / p50 5.95 / max 6.15 GiB/s，≥2048token 稳 ~6.0** | n=92，**这是干净的有效带宽** |
+
+- **真实 DRAM→HBM hicache load ≈ 6.0 GiB/s（≈6.4 GB/s）**，且**与 transfer 大小无关**（2048~9344 token 都 ~6.0）。
+- 远低于裸连续 pinned 拷的 ~57 GB/s → 瓶颈是**按 token 散列 gather**（`transfer_kv_per_layer_direct_pf_lf`，hipMemcpyAsync），不是 host↔GPU 链路。
+- 两种测法一致（5.8 vs 6.0）→ 逐层 sync 污染很小，结论稳。
+
+### 核心结论：SSD 能否替代 DRAM 作 KV load 源
+
+| 阶段 | 带宽 |
+|---|---|
+| DRAM 路径：host→device gather（本测） | **~6.0 GiB/s** |
+| SSD 路径：SSD→host 冷读（RAID0，bench_umbp_micro 64GB 工作集） | 8.72 GiB/s |
+| + 再 host→device gather（公共步骤） | ~6.0 GiB/s |
+
+- **host→device gather(~6.0) 才是整条 load 链的绑定瓶颈，而它比 SSD 冷读(8.72) 还慢。**
+- ⇒ SSD 读带宽(8.72) > gather(6.0)，**SSD 喂得过来**；DRAM 唯一优势（省掉 SSD→host）在 gather 成为瓶颈后**不再有用**。
+- ⇒ **SSD 可替代 DRAM 作 load 源，带宽损失极小**——只要 SSD→host 与 host→device 能 pipeline 重叠（hicache prefetch 本就异步），SSD 路径有效带宽 ≈ min(8.72, 6.0) = 6.0，与 DRAM 路径持平。
+- 前提/边界：① 测的是 `direct`+`page_first_direct` 散列 gather（skyriver07 必须 direct）；② SSD 冷读须达 RAID0 8.72（小工作集 cache 数不算）；③ 串行不重叠时 SSD 路径降到 ~3.55 GiB/s，需确认 prefetch 与 load 真重叠。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
