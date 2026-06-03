@@ -234,6 +234,22 @@ cp -v "$SO" /opt/venv/lib/python3.10/site-packages/sgl_kernel-0.3.21-py3.10-linu
 - **修正之前的错误结论**：6.0 不是"慢的 direct 回退、kernel 会更快"；**6.0(direct DMA) 反而是这台机散列 host→device 的较优值**。想突破 6.0 要靠 **GDS**（直 DMA 进 HBM、绕开 host 散列 gather），不是 kernel。
 - 实用建议：**skyriver07 继续用 `--hicache-io-backend direct`**（更快 + 本就稳）；kernel 修复价值在于"让 kernel 在 ROCm 可用"，但性能上 direct 更优。
 
+### 6.0 根因 = page_size 太小(72KiB 块);调大 page_size 直接提速(06-03 实测)
+
+每次传输块 = `page_size × kv_cache_dim × dtype`（MLA: page_size×1152B）。block 越大、拷贝次数越少、固定开销摊越薄。`bench_dram_to_hbm.py` 的 size 曲线（72KiB→0.62/6, 576KiB→22, 4.5MiB→47, ≥18MiB→53）证明：**慢的唯一原因是块太小**。
+
+**全栈 case2 direct AGG 实测（只改 `PAGE_SIZE`,不改代码）：**
+| page_size | 块(1页1层) | L2→HBM GiB/s | vs page64 |
+|---|---|---|---|
+| 64（bench 默认） | 72 KiB | 6.0 | 1× |
+| 128 | 144 KiB | **10.45** | 1.74× |
+| 256 | 288 KiB | **17.18** | **2.86×** |
+
+- **page256(17.2)已 ≥ L3-DRAM tier 读(15.6)** → gather 不再是那个 ~6 的瓶颈。
+- **结论:之前的 6.0 很大程度是 bench 写死 page_size=64(小块)的产物,不是硬件极限。** 调大 page_size 是当前**不改代码、最划算**的 load 提速手段。
+- page_size 由 bench 显式 `--page-size 64` 设定;AMD/aiter 不会自动选 64/128（那些是 NVIDIA flashmla/cutlass_mla 专属；cutlass_mla 用 128）。V3.1 是标准 MLA、非 DSA。
+- ⚠️ 代价:page_size 是全局 KV 分配/前缀匹配粒度 → 太大会**降前缀命中率**(短共享前缀)、增显存碎片、影响 attention。需按"load 带宽 vs 命中率"权衡,不能只为 load 无脑调大。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
