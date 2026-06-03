@@ -257,6 +257,27 @@ __global__ void transfer_kernel_impl(
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
+// On ROCm a GPU kernel CANNOT dereference a host virtual address (page-locked
+// or not) -> "Memory access fault by GPU".  For a host (CPU) tensor we must
+// translate its host pointer to the device-accessible pointer via
+// cudaHostGetDevicePointer (hipHostGetDevicePointer).  Confirmed by
+// tools/iobw/test_host_register.hip: devptr works for all sizes incl. 64GB,
+// hostptr always faults.  On CUDA the host pointer is already device-usable
+// under UVA, so this is a no-op there.
+static inline void* hicache_device_accessible_ptr(const at::Tensor& t) {
+  if (!t.defined()) return nullptr;
+  void* p = t.data_ptr();
+#if defined(USE_ROCM)
+  if (t.is_cpu()) {
+    void* dev = nullptr;
+    if (cudaHostGetDevicePointer(&dev, p, 0) == cudaSuccess && dev != nullptr) {
+      return dev;
+    }
+  }
+#endif
+  return p;
+}
+
 void transfer_kv_launcher(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -291,10 +312,10 @@ void transfer_kv_launcher(
   dim3 grid_dim(num_blocks, 1, 1);
   const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
 
-  const void* src_k_ptr = src_k.defined() ? src_k.data_ptr() : nullptr;
-  void* dst_k_ptr = dst_k.defined() ? dst_k.data_ptr() : nullptr;
-  const void* src_v_ptr = IsMLA || !src_v.defined() ? nullptr : src_v.data_ptr();
-  void* dst_v_ptr = IsMLA || !dst_v.defined() ? nullptr : dst_v.data_ptr();
+  const void* src_k_ptr = hicache_device_accessible_ptr(src_k);
+  void* dst_k_ptr = hicache_device_accessible_ptr(dst_k);
+  const void* src_v_ptr = IsMLA ? nullptr : hicache_device_accessible_ptr(src_v);
+  void* dst_v_ptr = IsMLA ? nullptr : hicache_device_accessible_ptr(dst_v);
   const uintptr_t* src_k_tbl_ptr = src_k_layers.defined() ? src_k_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* dst_k_tbl_ptr = dst_k_layers.defined() ? dst_k_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* src_v_tbl_ptr = IsMLA || !src_v_layers.defined() ? nullptr : src_v_layers.data_ptr<uintptr_t>();
