@@ -148,6 +148,32 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - 仅在并发不足以掩盖 prefetch 延迟时（单请求/冷启动）退化为串行 ~3.55；稳态批服务不受影响。
 - 仍可加的终极实测（可选）：case2(DRAM) vs case3(SSD 冷, 工作集>32GB proxy ring) 端到端吞吐对比，若相等即闭环。
 
+## L3-DRAM tier vs L3-SSD tier 读带宽（06-03 全栈实测，纠正了测错跳的问题）
+
+**重要纠正**：HICACHE-LOAD(6.0) 测的是 **L2 host→HBM 公共最后一跳**，对 DRAM/SSD 不敏感。
+DRAM/SSD 真正差异在 **L3→L2 prefetch（BatchGet）**。代码确认（`local_storage_manager.cpp:696-768`）：
+DRAM tier 读直走 `DramTier` 内存（不经 proxy ring）；只有 SSD tier 走 `SpdkProxyTier`→ring。
+
+全栈 case3 + READ_REPLAY，只改 `UMBP_DRAM_BYTES` 切 tier，看 `batch_get_v1 bandwidth_gib_s`：
+
+| L3 tier | 读带宽 GiB/s | vs DRAM | 备注 |
+|---|---|---|---|
+| DRAM tier（A 组 `UMBP_DRAM_BYTES=200G`） | **15.6** | 1× | 直读内存，无前置 cache，真值 |
+| SSD/DRAM warm（命中 32GB ring / DRAM-promote） | ~15.4 | 持平 | host 内存命中，**SSD 此时 == DRAM** |
+| SSD 单盘冷（88，B-cold 慢尾 549MiB/108-123ms） | **~4.9**（micro 4.91 印证） | 慢 3.2× | ≤ 单盘 PCIe 7.34 上限 ✓ |
+| SSD RAID0 冷（88+c3，micro-bench） | ~8.7 | 慢 1.8× | RAID0 ~2× 单盘 |
+
+**逼出全栈冷读**（warm cache 会盖住差异，必须破缓存；脚本已加 env）：
+`UMBP_AUTO_PROMOTE=false`（SSD 读不进 DRAM tier）+ `UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB=128`（ring~1GB<549MB批）+ `UMBP_DRAM_BYTES=1G`。
+即便如此 avg 仍冷热混合(7.1)，**看慢尾(p95/p99 耗时)才是纯冷**(~4.9)。
+
+### 两个 regime 决定 SSD 能否替代 DRAM（收口）
+1. **热集 ≤ proxy ring(默认~32GB)**：SSD 读全在 host ring 命中 ≈ 15.4 = DRAM → **SSD 免费替代,无损**。
+2. **热集 > ring（真冷读）**：SSD 单盘 4.9 / RAID0 8.7 vs DRAM 15.6 → **SSD 慢 1.8~3.2×**。
+   - direct backend(skyriver07) gather=6.0 → RAID0 冷(8.7)>6.0,gather 仍瓶颈,SSD 无损；
+   - **kernel backend(默认/正常机) gather 快(~20-40)** → prefetch 成瓶颈,SSD 冷(4.9/8.7)<DRAM(15.6) → **SSD 有损 1.8~3.2×**。
+- ⇒ **“SSD 无损替代 DRAM”只在 (热集≤ring) 或 (direct 慢 gather 当瓶颈) 时成立；冷集 + kernel 快 gather 时 SSD 明显慢于 DRAM。**
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
