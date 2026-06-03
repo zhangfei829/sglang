@@ -1,0 +1,37 @@
+---
+description: 排查"谁重启/关机了机器"的一键只读取证命令（共享多用户机，如 skyriver07）
+alwaysApply: true
+---
+
+# 谁重启了机器：一键取证
+
+共享机（多人 SSH）排查异常重启时用。分两层：**何时重启**（wtmp/journal 必有）+
+**谁触发**（非 root 重启走 sudo 留名；root 直接 reboot 只能靠来源 IP + history 倒推）。
+全部只读。RHEL/CentOS 认证日志在 `/var/log/secure`（Debian/Ubuntu 在 `/var/log/auth.log`）。
+
+## 一键收集（单行，paste-safe：首行自证机器、无 for/if/`$()`/子shell，`;` 分隔）
+
+```bash
+hostname; echo ===REBOOTS===; last -x | grep -iE "reboot|shutdown" | head -20; echo ===BOOTS===; journalctl --list-boots 2>/dev/null | tail -10; echo ===SECURE===; grep -iE "reboot|shutdown|poweroff|halt|systemctl" /var/log/secure 2>/dev/null | tail -40; echo ===AUTHLOG===; grep -iE "reboot|shutdown|poweroff|halt|systemctl" /var/log/auth.log 2>/dev/null | tail -40; echo ===SUDO_JRNL===; journalctl _COMM=sudo 2>/dev/null | grep -iE "reboot|shutdown|poweroff|halt|init 6|systemctl" | tail -40; echo ===AUDIT===; ausearch -m system_boot,system_shutdown,system_runlevel 2>/dev/null | tail -60; echo ===WHO_NOW===; who; echo ===LAST_LOGINS===; last | head -20
+```
+
+## 判读
+
+| 段 | 给出什么 | 能否定位用户 |
+|---|---|---|
+| `last -x ... reboot/shutdown` | 每次重启/关机的**时间点**（wtmp） | 否（只有时间） |
+| `journalctl --list-boots` | 各次 boot 的起止时间，确认重启次数 | 否 |
+| `/var/log/secure` / `auth.log` 里 `sudo: <user> ... COMMAND=/usr/sbin/reboot` | **谁** + 时间 + 命令 | **是**（非 root 重启必经 sudo） |
+| `journalctl _COMM=sudo` | systemd 系统的 sudo 调用记录 | 是 |
+| `ausearch SYSTEM_SHUTDOWN/BOOT` | 关联 `auid`（登录用户 id），最权威 | 是（auditd 在时） |
+| `last` FROM 列 | root 会话来源 IP | 间接（root 直接 reboot 时靠这个 + history） |
+
+## root 直接 reboot（不经 sudo）的兜底
+
+`sudo`/audit 都查不到时，按重启时间点对齐 root 会话来源 IP，再查对应 shell history：
+
+```bash
+hostname; echo ===ROOT_FROM===; last root | head; echo ===HISTORY===; grep -niE "reboot|shutdown|poweroff|halt|init 6" /root/.bash_history 2>/dev/null | tail; echo ===USER_HIST===; ls /home/*/.bash_history 2>/dev/null
+```
+
+`auid` → 用户名映射：`getent passwd <auid>`。
