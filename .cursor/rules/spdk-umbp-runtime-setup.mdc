@@ -174,6 +174,18 @@ DRAM tier 读直走 `DramTier` 内存（不经 proxy ring）；只有 SSD tier �
    - **kernel backend(默认/正常机) gather 快(~20-40)** → prefetch 成瓶颈,SSD 冷(4.9/8.7)<DRAM(15.6) → **SSD 有损 1.8~3.2×**。
 - ⇒ **“SSD 无损替代 DRAM”只在 (热集≤ring) 或 (direct 慢 gather 当瓶颈) 时成立；冷集 + kernel 快 gather 时 SSD 明显慢于 DRAM。**
 
+### 为什么 L2 host→HBM gather 在 skyriver07 只有 6.0（06-03 源码定位，根因坐实）
+
+源码 `sgl-kernel/csrc/kvcacheio/transfer.cu`：
+- `transfer_page_direct`(677-687) = 一次 `tensor.copy_(non_blocking)` = **一个 cudaMemcpyAsync**。
+- `transfer_kv_per_layer_direct_pf_lf` → `transfer_kv_page_first_direct_impl`：**第 795 行 `#if defined(USE_ROCM) ... fallback_to_page_copy()`** —— **ROCm 一律走逐页回退**：`for num_pages { for num_layers { transfer_page_direct } }`，即 **num_pages×num_layers 个独立小 cudaMemcpyAsync**（8512token=133页×61层≈**8113 次** 73.7KB 拷贝）→ **launch 开销 bound → 6.0**。
+- 快路径 `cudaMemcpyBatchAsync`（一次批量）**只在 CUDA 12.8+ 启用，`#if` 明确排除 ROCm**。
+- page_first_direct fallback **不合并连续页**（layer_first 的 `transfer_kv_direct` 712-719 会 `src_diff==1&&dst_diff==1` 合并）→ 拷贝数更没法降。
+- kernel backend（融合 gather，本应最快）→ **skyriver07 GPU fault**（06-03 实测 `Memory access fault by GPU node-2`，prefill 首次 load 即崩），不可用。
+
+**结论：6.0 不是 DRAM→HBM 硬件极限，是 "AMD 上 kernel 崩 + direct 无批量/无合并逐页拷" 的软件路径天花板。** 正常机（kernel 可用 / CUDA 12.8+ 批量）会快得多。
+**修复方向**：① 修 kernel backend 的 ROCm GPU fault（hipHostRegister 大缓冲不生效）= 拿到融合 gather 快路径（最优）；② 给 page_first_direct fallback 加连续页合并（中等）；③ GDS 直 DMA 绕开 host 中转+散列 gather（根治）。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
