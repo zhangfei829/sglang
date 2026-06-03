@@ -256,7 +256,6 @@ __global__ void transfer_kernel_impl(
   }
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 // On ROCm a GPU kernel CANNOT dereference a host virtual address (page-locked
 // or not) -> "Memory access fault by GPU".  For a host (CPU) tensor we must
 // translate its host pointer to the device-accessible pointer via
@@ -278,6 +277,7 @@ static inline void* hicache_device_accessible_ptr(const at::Tensor& t) {
   return p;
 }
 
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
