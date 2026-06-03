@@ -137,6 +137,17 @@ DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh
 - ⇒ **SSD 可替代 DRAM 作 load 源，带宽损失极小**——只要 SSD→host 与 host→device 能 pipeline 重叠（hicache prefetch 本就异步），SSD 路径有效带宽 ≈ min(8.72, 6.0) = 6.0，与 DRAM 路径持平。
 - 前提/边界：① 测的是 `direct`+`page_first_direct` 散列 gather（skyriver07 必须 direct）；② SSD 冷读须达 RAID0 8.72（小工作集 cache 数不算）；③ 串行不重叠时 SSD 路径降到 ~3.55 GiB/s，需确认 prefetch 与 load 真重叠。
 
+### prefetch 与 load 重叠性（06-03 代码 trace 确认，第③点已钉）
+
+调用链（scheduler.py）：
+- `_add_request_to_queue:1748` → `_prefetch_kvcache:1716` → `tree_cache.prefetch_from_storage`：
+  **请求一入 `waiting_queue` 就立刻异步发起 prefetch**（投进 `prefetch_queue`，由 `cache_controller.prefetch_thread_func` 独立线程做 storage→host，与主调度/load 解耦）。
+- staging 时 `get_new_batch_prefill:2158` `check_prefetch_progress(req.rid)`：**prefetch 未完成 → `continue` 跳过该请求、先调度别的**；完成后才 `add_one_req` → `init_load_back` → `start_loading`（host→device）。
+- ⇒ **prefetch(SSD→host) 在入队时提前跑，与其它在飞请求的 load(host→device)/compute 跨请求 pipeline 重叠**——重叠是设计内的，不是串行。
+- **结论钉死**：批量服务（多并发请求，真实场景）下 pipeline 填满 → SSD 路径有效带宽 = min(SSD冷读 8.72, gather 6.0) = **6.0 GiB/s ≈ DRAM 路径**。**SSD 可替代 DRAM 作 KV load 源，带宽无损**。
+- 仅在并发不足以掩盖 prefetch 延迟时（单请求/冷启动）退化为串行 ~3.55；稳态批服务不受影响。
+- 仍可加的终极实测（可选）：case2(DRAM) vs case3(SSD 冷, 工作集>32GB proxy ring) 端到端吞吐对比，若相等即闭环。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
