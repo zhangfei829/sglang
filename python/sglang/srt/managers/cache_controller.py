@@ -898,13 +898,14 @@ class HiCacheController:
 
                 print(
                     "[HICACHE-LOAD-AGG] tokens=%d layers=%d bytes=%d dt_ms=%.3f "
-                    "GiB/s=%.2f (effective all-layer DRAM->HBM, single sync)"
+                    "GiB/s=%.2f wall=%.6f (effective all-layer DRAM->HBM, single sync)"
                     % (
                         int(_tok),
                         int(self.layer_num),
                         _nbytes,
                         _dt_ms,
                         _nbytes / (_dt_ms / 1000.0) / (1024.0**3),
+                        time.time(),
                     ),
                     file=_sys.stderr,
                     flush=True,
