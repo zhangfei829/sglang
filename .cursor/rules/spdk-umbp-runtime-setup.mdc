@@ -207,6 +207,33 @@ GPU **无法解引用 host 虚拟地址**（任何 `cudaHostRegister` flag、任
 手动 build 报 `Cannot find source file: quick_all_reduce.hip`。**正确路：走 `3rdparty/amd/sgl-kernel/build_rocm.sh` 的 docker 镜像构建**（CI 内有完整 hipify），别在 skyriver07 手动 `pip install -e .`。
 - 还原手动 build 残留：`cp /tmp/CMakeLists.cuda.bak CMakeLists.txt; rm -f rocm_hipify.py rename_wheels_rocm.sh; git checkout -- .`。
 
+### sgl-kernel ROCm 官方编译方法（06-03 跑通，别再用 CMakeLists/pip install -e 瞎试）
+
+**官方 = `sgl-kernel/setup_rocm.py`**（setuptools + torch `BuildExtension(use_ninja=True)`，torch **自动正确 hipify** .cu，含 quick_all_reduce 的 buffer_store asm 也只是 warning 不崩）。**不用 CMakeLists_rocm.txt / 不用 pip install -e .**（那条要预生成 .hip + 手动 hipify，头文件改写不一致、whack-a-mole）。
+
+```bash
+cd /sgl-workspace/sglang/sgl-kernel
+git checkout -- . && git clean -fd csrc include            # 清掉任何手动 hipify 残留
+AMDGPU_TARGET=gfx942 MAX_JOBS=$(nproc) python setup_rocm.py build_ext --inplace 2>&1 | tee /tmp/sglk_build.log | tail -40
+# 装到运行 egg（sglang 从 egg import，不是源码树）：
+SO=$(ls python/sgl_kernel/common_ops.cpython-310-*.so|head -1)
+cp -v "$SO" /opt/venv/lib/python3.10/site-packages/sgl_kernel-0.3.21-py3.10-linux-x86_64.egg/sgl_kernel/
+```
+- 编 ~3-5 分钟（ninja 并行）。`.so` 落 `python/sgl_kernel/`，cp 覆盖 egg 即生效。
+- 我之前坑：用 CMakeLists_rocm + 我自己的 hipify_python + 头重定向 → 6 次失败；**正解就是 setup_rocm.py**。
+
+### kernel backend fault 修复成功 + 实测（06-03，重要反转）
+
+- **devptr 修复有效**：`SGLANG_HICACHE_HOST_REGISTER_FLAGS` 不需要；transfer.cu 的 `hicache_device_accessible_ptr`（CPU tensor 过 `cudaHostGetDevicePointer`）+ memory_pool_host.py data_ptrs 表翻译，编进新 egg 后 **kernel backend 不再 GPU fault**（case2 PASSED, fault=0, `io_backend=kernel`）。
+- ⚠️ **但 kernel 比 direct 慢!** 实测 case2 L2 host→HBM：
+  | backend | AGG GiB/s |
+  |---|---|
+  | direct（hipMemcpyAsync 逐页 = **DMA 引擎**） | **6.0** |
+  | kernel（GPU 线程经 devptr **散列读 host RAM**） | **4.24**（avg 4.25/p50 4.24/max 4.64） |
+- **物理原因**：host→device 搬运用 **DMA(direct) 本就比 GPU-gather(kernel) 快**；GPU 发起的细粒度 host 读经 PCIe 延迟高。kernel backend 适合源在 device/高速内存，不适合读 host RAM。
+- **修正之前的错误结论**：6.0 不是"慢的 direct 回退、kernel 会更快"；**6.0(direct DMA) 反而是这台机散列 host→device 的较优值**。想突破 6.0 要靠 **GDS**（直 DMA 进 HBM、绕开 host 散列 gather），不是 kernel。
+- 实用建议：**skyriver07 继续用 `--hicache-io-backend direct`**（更快 + 本就稳）；kernel 修复价值在于"让 kernel 在 ROCm 可用"，但性能上 direct 更优。
+
 ## 问题与成果记录（2026-06-01 skyriver07）
 
 ### 成果（目标达成）
