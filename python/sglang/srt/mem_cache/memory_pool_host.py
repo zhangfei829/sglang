@@ -122,9 +122,31 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+        # flags=0 (cudaHostRegisterDefault) only page-locks; the GPU cannot
+        # dereference the host pointer, so the hicache "kernel" IO backend
+        # GPU-faults on ROCm.  cudaHostRegisterMapped (0x02) maps the buffer
+        # into the device address space so the kernel can read it directly.
+        # Env-gated (default 0 = current behavior, safe for the "direct"
+        # backend which uses cudaMemcpyAsync and needs no mapping).
+        _reg_flags = int(
+            os.environ.get("SGLANG_HICACHE_HOST_REGISTER_FLAGS", "0") or "0"
         )
+        err = torch.cuda.cudart().cudaHostRegister(
+            buffer.data_ptr(), buffer.numel() * buffer.element_size(), _reg_flags
+        )
+        if _reg_flags != 0 and int(err) != 0:
+            # Mapped registration failed (e.g. buffer too large for the GPU
+            # BAR aperture) -> fall back to plain page-lock so the direct
+            # backend still works; log once so we know kernel backend is N/A.
+            logger.warning(
+                "cudaHostRegister(flags=%d) failed err=%s; falling back to "
+                "flags=0 (kernel IO backend unavailable for this buffer).",
+                _reg_flags,
+                int(err),
+            )
+            torch.cuda.cudart().cudaHostRegister(
+                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            )
     return buffer
 
 
