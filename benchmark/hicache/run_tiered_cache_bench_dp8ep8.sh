@@ -445,6 +445,9 @@ launch_server_case3() {
         spdk_fields+=", \"spdk_proxy_auto_start\": ${UMBP_SPDK_PROXY_AUTO_START}"
         spdk_fields+=", \"spdk_proxy_startup_timeout_ms\": ${UMBP_SPDK_PROXY_STARTUP_TIMEOUT_MS}"
         spdk_fields+=", \"spdk_proxy_tenant_id_base\": 0"
+        # Optional: shrink the proxy ring cache to force cold SSD reads (cold-bench).
+        [[ -n "${UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB:-}" ]] && \
+            spdk_fields+=", \"spdk_proxy_data_per_channel_mb\": ${UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB}"
     fi
     local dist_fields=""
     if [[ -n "$UMBP_MASTER_ADDRESS" ]]; then
@@ -469,7 +472,7 @@ launch_server_case3() {
     if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
         ssd_enabled_json="false"
     fi
-    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": ${UMBP_AUTO_PROMOTE:-true}, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
 
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
