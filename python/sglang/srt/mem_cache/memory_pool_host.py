@@ -171,6 +171,36 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     },
 )
 
+_HIP_LIB = None
+
+
+def host_to_device_accessible_ptr(host_ptr: int) -> int:
+    """ROCm: translate a registered host pointer to its device-accessible
+    pointer via hipHostGetDevicePointer, so the hicache 'kernel' IO backend's
+    GPU kernels (which dereference per-layer host KV pointers from a pointer
+    table) do not fault.  No-op on CUDA (host ptr is device-usable under UVA)
+    or on any failure.  The host buffer must already be cudaHostRegister'd.
+    """
+    if getattr(torch.version, "hip", None) is None:
+        return host_ptr
+    if os.environ.get("SGLANG_HICACHE_KERNEL_DEVPTR", "1") in ("0", "false", "False"):
+        return host_ptr
+    global _HIP_LIB
+    try:
+        import ctypes
+
+        if _HIP_LIB is None:
+            _HIP_LIB = ctypes.CDLL("libamdhip64.so")
+        dev = ctypes.c_void_p()
+        rc = _HIP_LIB.hipHostGetDevicePointer(
+            ctypes.byref(dev), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
+        )
+        if rc == 0 and dev.value:
+            return int(dev.value)
+    except Exception:
+        pass
+    return host_ptr
+
 
 class HostKVCache(abc.ABC):
 
@@ -799,8 +829,10 @@ class MLATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        # On ROCm the kernel IO backend dereferences these per-layer host
+        # pointers on-GPU; translate to device-accessible pointers or it faults.
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
+            [host_to_device_accessible_ptr(x.data_ptr()) for x in self.data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
