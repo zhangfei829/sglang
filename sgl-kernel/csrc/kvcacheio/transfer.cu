@@ -2,7 +2,6 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAStreamGuard.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
@@ -860,10 +859,12 @@ inline void transfer_kv_page_first_direct_impl(
 
       int64_t ctr = 0;
       page_copy_loop([&](const at::Tensor& s, const at::Tensor& d, int64_t si, int64_t di, int64_t ps) {
-        c10::cuda::CUDAStreamGuard guard(pool[ctr % num_streams]);
+        at::cuda::setCurrentCUDAStream(pool[ctr % num_streams]);
         transfer_page_direct(s, d, si, di, ps);
         ++ctr;
       });
+      // Restore the main stream before recording completion / returning.
+      at::cuda::setCurrentCUDAStream(main_stream);
 
       for (auto& s : pool) {
         at::cuda::CUDAEvent done_evt;
