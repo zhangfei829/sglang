@@ -1,0 +1,34 @@
+---
+description: 切换 mori 分支时要带走的本地改动清单(本会话只改 sglang，没改 mori）
+alwaysApply: true
+---
+
+# 切 mori 分支的带走清单
+
+## 本会话(IO 带宽/hicache 调查)的改动全在 sglang,不在 mori
+分支 `zhangfei829/sglang` `test/umbp-io-bandwidth-stats-tools`:
+- `sgl-kernel/csrc/kvcacheio/transfer.cu`:`hicache_device_accessible_ptr`(ROCm kernel-backend GPU-fault 修复)→ **需 `setup_rocm.py` 重编 sgl-kernel**。
+- `python/.../mem_cache/memory_pool_host.py`:HICACHE-LOAD/ENTER 埋点、`host_to_device_accessible_ptr`+data_ptrs 表翻译、`SGLANG_HICACHE_HOST_REGISTER_FLAGS` env(纯 Python)。
+- `python/.../managers/cache_controller.py`:`start_loading` 标记 + `SGLANG_HICACHE_LOAD_AGG` 聚合计时。
+- `benchmark/hicache/run_tiered_cache_bench_dp8ep8.sh`:`UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB`、`UMBP_AUTO_PROMOTE` env。
+- `tools/iobw/`:bench_dram_to_hbm.py、analyze_hicache_load.py、test_host_register.hip、run_host_register_probe.sh、run_umbp_iobw_test.sh、diagnose/summarize。
+- `python/.../storage/umbp/umbp_store.py`:IOBW 遥测。
+
+## mori 要带走的改动(之前会话,在 `zhangfei829/mori` `fix/umbp-proxy-copy-threads`,相对 upstream/main 9 commit)
+| commit | 内容 | 重要性 |
+|---|---|---|
+| `ab93d3b2` | Revert 上游 #262(release GIL)→ 修分布式 scheduler 饿死 | **必带**(新 base 含 #262 时) |
+| `625ff540` | `UMBP_SPDK_PROXY_COPY_THREADS` 并行 proxy ring-fill memcpy | 中(opt-in,默认1;实测写没提速,无害) |
+| `01f236c2`+`fadba9a4` | `UMBP_SPDK_PROXY_TIMING` + BatchPut fill/wait 调试日志 | 低(调试可选) |
+| `211397d5`+`8b705423`+`accc05da`+`6a3e0d60` | DummySsdTier 后端 + 测试 | 按需(策略调优) |
+| `ba19026d` | packaging:JIT 含 tools/profiler(pip 装 mori) | 装包需要 |
+
+涉及文件:`spdk_proxy_tier.cpp`、`pybind_umbp.cpp`、`local_storage_manager.cpp`、`dummy_ssd_tier.{h,cpp}`、`setup.py`、`CMakeLists.txt`、`tests/...`。
+> Windows 本地 mori 那几个 "M 未提交" 多半是 CRLF 行尾噪声,以**远端 /sgl-workspace/mori `git status`** 为准。
+
+cherry-pick 到新分支:`git cherry-pick ab93d3b2 625ff540 211397d5 8b705423 accc05da 6a3e0d60 ba19026d 01f236c2 fadba9a4`(按需取子集,`ab93d3b2` 最关键)。
+
+## 关键结论回顾(避免重复踩)
+- L2→HBM gather 6.0 是 **page_size=64 小块(72KiB)** 的产物;调大 page → 10.4(128)/17.2(256),不改代码。
+- kernel backend ROCm 必须 devptr 修复(已写);但 kernel(4.24)比 direct(6.0)慢 → AMD 用 direct。
+- sgl-kernel ROCm 官方编译 = `python setup_rocm.py build_ext --inplace`(torch 自动 hipify),不是 CMakeLists/pip install -e。
