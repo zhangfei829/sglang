@@ -1,9 +1,14 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAStreamGuard.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -707,6 +712,26 @@ inline void transfer_page_direct(
           /* non_blocking= */ true);
 }
 
+// Number of CUDA/HIP streams used to parallelize the per-page direct copies.
+// Default 1 = original single-stream behavior (zero behavior change unless the
+// env var is set).  Set SGLANG_HICACHE_DIRECT_STREAMS=8 to spread the many tiny
+// per-page hipMemcpyAsync copies across multiple streams so independent DMA
+// engines run concurrently (mimics the batched-memcpy throughput on platforms
+// without cudaMemcpyBatchAsync / hipMemcpyBatchAsync, e.g. ROCm < 7.1).
+static inline int hicache_direct_num_streams() {
+  static int n = []() {
+    const char* e = std::getenv("SGLANG_HICACHE_DIRECT_STREAMS");
+    int v = e ? std::atoi(e) : 1;
+    if (v < 1) v = 1;
+    if (v > 64) v = 64;
+    fprintf(stderr, "[HICACHE-DIRECT] page_first_direct copy streams = %d%s\n", v,
+            v > 1 ? " (multi-stream enabled)" : " (single-stream, default)");
+    fflush(stderr);
+    return v;
+  }();
+  return n;
+}
+
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,
@@ -771,7 +796,10 @@ inline void transfer_kv_page_first_direct_impl(
   int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
   int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
-  auto fallback_to_page_copy = [&]() {
+  // Shared per-page copy loop.  `emit(src, dst, src_idx, dst_idx, page_size)` is
+  // invoked once per (page, layer[, K/V]) item; the caller decides whether to
+  // run each copy on the current stream or rotate across multiple streams.
+  auto page_copy_loop = [&](auto&& emit) {
     if constexpr (IsLf2Pf) {
       const bool is_mla = dst_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
@@ -779,15 +807,11 @@ inline void transfer_kv_page_first_direct_impl(
         const int64_t s_index = src_indices_ptr[i * page_size];
         const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
         for (int64_t j = 0; j < num_layers; ++j) {
-          transfer_page_direct(
-              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+          emit(src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index,
+               (int64_t)0, page_size);
           if (!is_mla) {
-            transfer_page_direct(
-                src_ptrs[j + num_layers],
-                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
-                s_index,
-                0,
-                page_size);
+            emit(src_ptrs[j + num_layers], dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                 s_index, (int64_t)0, page_size);
           }
         }
       }
@@ -798,22 +822,57 @@ inline void transfer_kv_page_first_direct_impl(
         const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
         const int64_t d_index = dst_indices_ptr[i * page_size];
         for (int64_t j = 0; j < num_layers; ++j) {
-          transfer_page_direct(
-              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+          emit(src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], (int64_t)0,
+               d_index, page_size);
           if (!is_mla) {
-            transfer_page_direct(
-                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
-                dst_ptrs[j + num_layers],
-                0,
-                d_index,
-                page_size);
+            emit(src_ptrs[1].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j + num_layers],
+                 (int64_t)0, d_index, page_size);
           }
         }
       }
     }
   };
 
+  auto fallback_to_page_copy = [&]() {
+    page_copy_loop([](const at::Tensor& s, const at::Tensor& d, int64_t si, int64_t di, int64_t ps) {
+      transfer_page_direct(s, d, si, di, ps);
+    });
+  };
+
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  {
+    const int num_streams = hicache_direct_num_streams();
+    if (num_streams > 1) {
+      // Multi-stream variant: rotate the tiny per-page copies across
+      // `num_streams` streams so independent DMA engines run concurrently and
+      // per-copy launch overhead overlaps with in-flight transfers.
+      // Correctness is preserved by (1) blocking the pool streams on the main
+      // stream's prior work and (2) blocking the main stream on all pool
+      // streams before returning.
+      auto main_stream = at::cuda::getCurrentCUDAStream();
+      std::vector<at::cuda::CUDAStream> pool;
+      pool.reserve(num_streams);
+      for (int i = 0; i < num_streams; ++i) pool.push_back(at::cuda::getStreamFromPool());
+
+      at::cuda::CUDAEvent start_evt;
+      start_evt.record(main_stream);
+      for (auto& s : pool) start_evt.block(s);
+
+      int64_t ctr = 0;
+      page_copy_loop([&](const at::Tensor& s, const at::Tensor& d, int64_t si, int64_t di, int64_t ps) {
+        c10::cuda::CUDAStreamGuard guard(pool[ctr % num_streams]);
+        transfer_page_direct(s, d, si, di, ps);
+        ++ctr;
+      });
+
+      for (auto& s : pool) {
+        at::cuda::CUDAEvent done_evt;
+        done_evt.record(s);
+        done_evt.block(main_stream);
+      }
+      return;
+    }
+  }
   fallback_to_page_copy();
   return;
 
