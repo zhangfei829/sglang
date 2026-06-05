@@ -719,12 +719,17 @@ inline void transfer_page_direct(
 // without cudaMemcpyBatchAsync / hipMemcpyBatchAsync, e.g. ROCm < 7.1).
 static inline int hicache_direct_num_streams() {
   static int n = []() {
+    // Default 4: spreads the per-page direct copies across 4 streams so
+    // independent DMA engines run concurrently. Microbench on MI300X shows
+    // 4 streams already reaches the throughput plateau (~20 GiB/s, ~3x over
+    // single-stream) while contending less with compute streams than 8/16.
+    // Set SGLANG_HICACHE_DIRECT_STREAMS=1 to disable (single stream).
     const char* e = std::getenv("SGLANG_HICACHE_DIRECT_STREAMS");
-    int v = e ? std::atoi(e) : 1;
+    int v = e ? std::atoi(e) : 4;
     if (v < 1) v = 1;
     if (v > 64) v = 64;
     fprintf(stderr, "[HICACHE-DIRECT] page_first_direct copy streams = %d%s\n", v,
-            v > 1 ? " (multi-stream enabled)" : " (single-stream, default)");
+            v > 1 ? " (multi-stream)" : " (single-stream)");
     fflush(stderr);
     return v;
   }();
