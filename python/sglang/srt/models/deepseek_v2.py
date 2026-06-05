@@ -22,6 +22,8 @@ import logging
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1966,6 +1968,11 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
+        _lt_on = (
+            os.environ.get("SGLANG_LAYER_COMPUTE_TIMING", "") not in ("", "0", "false", "False")
+            and forward_batch.forward_mode.is_extend()
+        )
+        _lt_events = [] if _lt_on else None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -1983,6 +1990,10 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
+                if _lt_on:
+                    _e0 = torch.cuda.Event(enable_timing=True)
+                    _e1 = torch.cuda.Event(enable_timing=True)
+                    _e0.record()
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
@@ -1991,6 +2002,17 @@ class DeepseekV2Model(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     llama_4_scaling,
+                )
+                if _lt_on:
+                    _e1.record()
+                    _lt_events.append((i, _e0, _e1))
+
+        if _lt_on and _lt_events:
+            torch.cuda.synchronize()
+            for _li, _a, _b in _lt_events:
+                print(
+                    f"[LAYER-COMPUTE] layer={_li} dt_ms={_a.elapsed_time(_b):.3f}",
+                    flush=True,
                 )
 
         if normal_end_layer != self.end_layer:
