@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 import torch
@@ -9,6 +10,11 @@ def is_hip() -> bool:
 
 _is_hip = is_hip()
 
+# Grid block cap for the kernel KV-transfer ops. Higher = more blocks/warps =
+# higher GPU occupancy for the copy (fixes under-occupancy on MI300X). Tunable
+# via env for A/B (e.g. SGLANG_HICACHE_BLOCK_QUOTA=2 reproduces the old default).
+_DEFAULT_BLOCK_QUOTA = int(os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA", "4096"))
+
 
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
@@ -18,7 +24,7 @@ def transfer_kv_per_layer(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer.default(
@@ -44,7 +50,7 @@ def transfer_kv_per_layer_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf.default(
@@ -74,7 +80,7 @@ def transfer_kv_per_layer_ph_lf(
     src_layout_dim: int,
     page_size: int,
     head_num: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf.default(
@@ -103,7 +109,7 @@ def transfer_kv_all_layer(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer.default(
@@ -130,7 +136,7 @@ def transfer_kv_all_layer_lf_pf(
     item_size: int,
     dst_layout_dim: int,
     num_layers: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf.default(
@@ -160,7 +166,7 @@ def transfer_kv_all_layer_lf_ph(
     num_layers: int,
     page_size: int,
     head_num: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph.default(
@@ -223,7 +229,7 @@ def transfer_kv_per_layer_mla(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
@@ -245,7 +251,7 @@ def transfer_kv_per_layer_mla_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
@@ -268,7 +274,7 @@ def transfer_kv_all_layer_mla(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla.default(
@@ -291,7 +297,7 @@ def transfer_kv_all_layer_mla_lf_pf(
     item_size: int,
     dst_layout_dim: int,
     num_layers: int,
-    block_quota: int = 4096,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf.default(
