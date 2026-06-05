@@ -18,7 +18,7 @@ def transfer_kv_per_layer(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer.default(
@@ -44,7 +44,7 @@ def transfer_kv_per_layer_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf.default(
@@ -74,7 +74,7 @@ def transfer_kv_per_layer_ph_lf(
     src_layout_dim: int,
     page_size: int,
     head_num: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf.default(
@@ -103,7 +103,7 @@ def transfer_kv_all_layer(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer.default(
@@ -130,7 +130,7 @@ def transfer_kv_all_layer_lf_pf(
     item_size: int,
     dst_layout_dim: int,
     num_layers: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf.default(
@@ -160,7 +160,7 @@ def transfer_kv_all_layer_lf_ph(
     num_layers: int,
     page_size: int,
     head_num: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph.default(
@@ -223,7 +223,7 @@ def transfer_kv_per_layer_mla(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
@@ -245,7 +245,7 @@ def transfer_kv_per_layer_mla_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
@@ -268,7 +268,7 @@ def transfer_kv_all_layer_mla(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla.default(
@@ -291,7 +291,7 @@ def transfer_kv_all_layer_mla_lf_pf(
     item_size: int,
     dst_layout_dim: int,
     num_layers: int,
-    block_quota: int = 2,
+    block_quota: int = 4096,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf.default(
