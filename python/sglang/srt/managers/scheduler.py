@@ -1161,6 +1161,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        _loop_timing = os.environ.get("SGLANG_LOOP_TIMING") == "1"
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1170,13 +1171,36 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
+            if _loop_timing:
+                self.device_module.synchronize()
+                _ts0 = time.perf_counter()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
+                if _loop_timing:
+                    self.device_module.synchronize()
+                    _ts1 = time.perf_counter()
                 result = self.run_batch(batch)
+                if _loop_timing:
+                    self.device_module.synchronize()
+                    _ts2 = time.perf_counter()
                 self.process_batch_result(batch, result)
+                if _loop_timing:
+                    self.device_module.synchronize()
+                    _ts3 = time.perf_counter()
+                    print(
+                        "[LOOP-TIMING] mode=%s bs=%d getbatch_ms=%.3f runbatch_ms=%.3f process_ms=%.3f"
+                        % (
+                            str(batch.forward_mode),
+                            len(batch.reqs),
+                            (_ts1 - _ts0) * 1000.0,
+                            (_ts2 - _ts1) * 1000.0,
+                            (_ts3 - _ts2) * 1000.0,
+                        ),
+                        flush=True,
+                    )
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
