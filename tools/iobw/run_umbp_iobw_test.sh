@@ -207,7 +207,8 @@ run_bench() {
     log "  REQUEST_RATE    = $REQUEST_RATE"
     log "  HICACHE_SIZE    = $HICACHE_SIZE"
     log "  UMBP_SSD_BACKEND= $UMBP_SSD_BACKEND"
-    log "  UMBP_SPDK_NVME  = $UMBP_SPDK_NVME_PCI"
+    log "  UMBP_SSD_BYTES  = ${UMBP_SSD_BYTES:-}"
+    log "  UMBP_SPDK_NVME  = ${UMBP_SPDK_NVME_PCI:-}"
     log "  DUMMY_FORWARD   = $DUMMY_FORWARD"
 
     pushd "$REPO_DIR" >/dev/null
