@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -198,8 +200,29 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
     )
 
+    _mlp_t = os.environ.get("SGLANG_MLPSYNC_TIMING") == "1"
     if not skip_all_gather:
+        if _mlp_t:
+            if str(device) != "cpu":
+                torch.cuda.synchronize()
+            _mt0 = time.perf_counter()
         mlp_sync_info.all_gather(device=device, group=group)
+        if _mlp_t:
+            if str(device) != "cpu":
+                torch.cuda.synchronize()
+            print(
+                "[MLPSYNC] all_gather_ms=%.3f device=%s mode=%s"
+                % (
+                    (time.perf_counter() - _mt0) * 1000.0,
+                    str(device),
+                    (
+                        str(local_batch.forward_mode)
+                        if local_batch is not None
+                        else "None"
+                    ),
+                ),
+                flush=True,
+            )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
