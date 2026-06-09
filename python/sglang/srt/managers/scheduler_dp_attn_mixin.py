@@ -201,7 +201,17 @@ def prepare_mlp_sync_batch_raw(
     )
 
     _mlp_t = os.environ.get("SGLANG_MLPSYNC_TIMING") == "1"
+    _mlp_bar = os.environ.get("SGLANG_MLPSYNC_BARRIER_TIMING") == "1"
     if not skip_all_gather:
+        _bar_ms = 0.0
+        if _mlp_t and _mlp_bar:
+            if str(device) != "cpu":
+                torch.cuda.synchronize()
+            _bt0 = time.perf_counter()
+            torch.distributed.barrier(group=group)
+            if str(device) != "cpu":
+                torch.cuda.synchronize()
+            _bar_ms = (time.perf_counter() - _bt0) * 1000.0
         if _mlp_t:
             if str(device) != "cpu":
                 torch.cuda.synchronize()
@@ -211,8 +221,9 @@ def prepare_mlp_sync_batch_raw(
             if str(device) != "cpu":
                 torch.cuda.synchronize()
             print(
-                "[MLPSYNC] all_gather_ms=%.3f device=%s mode=%s"
+                "[MLPSYNC] barrier_ms=%.3f allgather_after_barrier_ms=%.3f device=%s mode=%s"
                 % (
+                    _bar_ms,
                     (time.perf_counter() - _mt0) * 1000.0,
                     str(device),
                     (
