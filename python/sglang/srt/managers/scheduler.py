@@ -2160,8 +2160,23 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
+            _ps_t = os.environ.get("SGLANG_GETBATCH_TIMING") == "1"
+            if _ps_t:
+                _ps0 = time.perf_counter()
             self.chunked_req.init_next_round_input()
+            if _ps_t:
+                _ps1 = time.perf_counter()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if _ps_t:
+                _ps2 = time.perf_counter()
+                print(
+                    "[PREFILL-SCHED] init_next_round_ms=%.3f add_chunked_req_ms=%.3f"
+                    % (
+                        (_ps1 - _ps0) * 1000.0,
+                        (_ps2 - _ps1) * 1000.0,
+                    ),
+                    flush=True,
+                )
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
