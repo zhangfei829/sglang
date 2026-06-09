@@ -92,6 +92,29 @@ static inline void nt_copy_avx512_sl(char* d, const char* s, size_t n) {
   _mm_sfence();
 }
 
+// Cached AVX-512 copy: regular (cacheable) stores, NOT non-temporal. For blocks
+// that fit L2/L3 this is much faster than NT on Zen4 (NT forces every byte to
+// memory; cached stays in cache). x86 DMA is cache-coherent so a later host->dev
+// DMA still reads correct data.
+static inline void cached_copy_avx512(char* d, const char* s, size_t n) {
+  size_t i = 0;
+  for (; i + 256 <= n; i += 256) {
+    __m512i a = _mm512_loadu_si512(s + i);
+    __m512i b = _mm512_loadu_si512(s + i + 64);
+    __m512i c = _mm512_loadu_si512(s + i + 128);
+    __m512i e = _mm512_loadu_si512(s + i + 192);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i), a);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i + 64), b);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i + 128), c);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i + 192), e);
+  }
+  for (; i + 64 <= n; i += 64) {
+    __m512i a = _mm512_loadu_si512(s + i);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i), a);
+  }
+  if (i < n) std::memcpy(d + i, s + i, n - i);
+}
+
 static double gibps(size_t bytes, double sec) {
   return (double)bytes / sec / (1024.0 * 1024.0 * 1024.0);
 }
@@ -99,9 +122,9 @@ static double gibps(size_t bytes, double sec) {
 int main() {
   const size_t sizes[] = {64ul * 1024, 256ul * 1024, 1ul << 20, 4ul << 20,
                           16ul << 20, 137ul << 20};
-  const int names_n = 4;
+  const int names_n = 5;
   const char* names[names_n] = {"glibc_memcpy", "avx2_nt", "avx512_nt",
-                                "avx512_sl_nt"};
+                                "avx512_sl_nt", "avx512_cached"};
   printf("%-14s", "block");
   for (int m = 0; m < names_n; ++m) printf("%14s", names[m]);
   printf("   (GiB/s, single-thread)\n");
@@ -120,14 +143,16 @@ int main() {
         if (m == 0) std::memcpy(dst, src, sz);
         else if (m == 1) nt_copy_avx2(dst, src, sz);
         else if (m == 2) nt_copy_avx512(dst, src, sz);
-        else nt_copy_avx512_sl(dst, src, sz);
+        else if (m == 3) nt_copy_avx512_sl(dst, src, sz);
+        else cached_copy_avx512(dst, src, sz);
       }
       auto t0 = std::chrono::high_resolution_clock::now();
       for (int it = 0; it < iters; ++it) {
         if (m == 0) std::memcpy(dst, src, sz);
         else if (m == 1) nt_copy_avx2(dst, src, sz);
         else if (m == 2) nt_copy_avx512(dst, src, sz);
-        else nt_copy_avx512_sl(dst, src, sz);
+        else if (m == 3) nt_copy_avx512_sl(dst, src, sz);
+        else cached_copy_avx512(dst, src, sz);
       }
       auto t1 = std::chrono::high_resolution_clock::now();
       double sec = std::chrono::duration<double>(t1 - t0).count() / iters;
