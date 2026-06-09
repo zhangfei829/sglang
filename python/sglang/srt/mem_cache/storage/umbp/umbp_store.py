@@ -1145,6 +1145,14 @@ class UMBPStore(HiCacheStorage):
             len(key_strs),
             total_bytes,
         )
+        _get_delay_ms = os.environ.get("SGLANG_UMBP_GET_DELAY_MS")
+        if _get_delay_ms:
+            try:
+                _d = float(_get_delay_ms)
+                if _d > 0:
+                    time.sleep(_d / 1000.0)
+            except ValueError:
+                pass
         start_time = time.perf_counter()
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
         elapsed_s = time.perf_counter() - start_time
