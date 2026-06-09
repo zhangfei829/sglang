@@ -50,14 +50,14 @@ static inline void nt_copy_avx512(char* d, const char* s, size_t n) {
     __m512i b = _mm512_loadu_si512(s + i + 64);
     __m512i c = _mm512_loadu_si512(s + i + 128);
     __m512i e = _mm512_loadu_si512(s + i + 192);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i), a);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i + 64), b);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i + 128), c);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i + 192), e);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i), a);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 64), b);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 128), c);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 192), e);
   }
   for (; i + 64 <= n; i += 64) {
     __m512i a = _mm512_loadu_si512(s + i);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i), a);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i), a);
   }
   if (i < n) std::memcpy(d + i, s + i, n - i);
   _mm_sfence();
@@ -75,18 +75,18 @@ static inline void nt_copy_avx512_sl(char* d, const char* s, size_t n) {
   std::memcpy(d, s, head);
   size_t i = head;
   for (; i + 256 <= n; i += 256) {
-    __m512i a = _mm512_stream_load_si512(const_cast<void*>(reinterpret_cast<const void*>(s + i)));
-    __m512i b = _mm512_stream_load_si512(const_cast<void*>(reinterpret_cast<const void*>(s + i + 64)));
-    __m512i c = _mm512_stream_load_si512(const_cast<void*>(reinterpret_cast<const void*>(s + i + 128)));
-    __m512i e = _mm512_stream_load_si512(const_cast<void*>(reinterpret_cast<const void*>(s + i + 192)));
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i), a);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i + 64), b);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i + 128), c);
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i + 192), e);
+    __m512i a = _mm512_stream_load_si512((void*)(s + i));
+    __m512i b = _mm512_stream_load_si512((void*)(s + i + 64));
+    __m512i c = _mm512_stream_load_si512((void*)(s + i + 128));
+    __m512i e = _mm512_stream_load_si512((void*)(s + i + 192));
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i), a);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 64), b);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 128), c);
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 192), e);
   }
   for (; i + 64 <= n; i += 64) {
-    __m512i a = _mm512_stream_load_si512(const_cast<void*>(reinterpret_cast<const void*>(s + i)));
-    _mm512_stream_si512(reinterpret_cast<void*>(d + i), a);
+    __m512i a = _mm512_stream_load_si512((void*)(s + i));
+    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i), a);
   }
   if (i < n) std::memcpy(d + i, s + i, n - i);
   _mm_sfence();
