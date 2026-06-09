@@ -2456,6 +2456,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         HiCache write-through pipeline so that tiered-cache storage behaviour
         can be stress-tested without paying for GEMM / attention compute.
         """
+        _dbg_t = os.environ.get("SGLANG_DUMMY_FWD_TIMING") == "1"
+        if _dbg_t:
+            import time as _t
+
+            torch.cuda.synchronize()
+            _t0 = _t.perf_counter()
         kv_pool = forward_batch.token_to_kv_pool
         if (
             kv_pool is not None
@@ -2466,6 +2472,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for i in range(kv_pool.layer_num):
                 buf = kv_pool.kv_buffer[i]
                 buf[loc] = 1e-3
+        if _dbg_t:
+            torch.cuda.synchronize()
+            _nloc = (
+                forward_batch.out_cache_loc.numel()
+                if forward_batch.out_cache_loc is not None
+                else 0
+            )
+            print(
+                "[DUMMY-FWD] kv_write_ms=%.3f nloc=%d bs=%d"
+                % ((_t.perf_counter() - _t0) * 1000.0, _nloc, forward_batch.batch_size),
+                flush=True,
+            )
 
         logits = torch.zeros(
             forward_batch.batch_size,
