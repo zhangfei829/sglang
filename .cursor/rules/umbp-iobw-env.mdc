@@ -1,0 +1,156 @@
+---
+description: Known-good UMBP IOBW benchmark environment (skyriver07 / MI300X). Use these exact values, never guess MODEL_PATH.
+alwaysApply: true
+---
+
+# UMBP IOBW Benchmark — Known-Good Environment
+
+These values are taken from runs that actually PASSED in the transcript history.
+**Never invent a MODEL_PATH.** The default `/nfs/data/DeepSeek-V3` in
+`tools/iobw/run_umbp_iobw_test.sh` is WRONG on the skyriver07 box (no config.json there).
+
+## Tiers & which case to run (READ THIS FIRST)
+
+Hierarchy: **L1 = HBM (device)**, **L2 = host DRAM** (`--hicache-size` /
+`MLATokenToKVPoolHost`), **L3 = UMBP storage backend** (UMBP DRAM tier and/or SSD tier).
+
+- The **default / primary test is DRAM-only L3: L3 DRAM -> L2 DRAM -> HBM. NO SPDK/SSD.**
+- bench cases (`run_tiered_cache_bench_dp8ep8.sh`):
+  - `case1:HBM_Only`  = L1 only (no hierarchical cache).
+  - `case2:HBM_DRAM`  = L1 + L2 host DRAM, **NO UMBP / NO L3** (just `--enable-hierarchical-cache`).
+  - `case3:HBM_DRAM_SSD` = L1 + L2 + **L3 UMBP**. This is the ONLY case that exercises UMBP.
+- To test the **L3 DRAM tier WITHOUT SSD/SPDK**: use `case3` but disable SSD:
+  - `UMBP_SSD_BYTES=0`  -> `ssd_enabled=false` (L3 = UMBP DRAM tier only).
+  - `UMBP_SSD_BACKEND=posix` (default) -> bench injects NO `spdk_*` fields
+    (it only adds them when backend != posix; see launch_server_case3 L441).
+  - `UMBP_DRAM_BYTES` sets the L3 DRAM tier capacity (default 64 GB/rank).
+- Only set `UMBP_SSD_BACKEND=spdk_proxy` + `UMBP_SPDK_NVME_PCI` + `UMBP_SPDK_PROXY_BIN`
+  + `UMBP_SSD_BYTES>0` when you explicitly want the SSD/SPDK tier. Passing those in a
+  DRAM-only run is what caused the bogus `spdk_nvme_pci_addr` path.
+
+### To MEASURE L3 READ bandwidth (BatchGet): use READ_REPLAY=true
+
+Without it you only get writes (`BatchPut`), because reused prefixes still hit
+L1/L2 and never read L3 -> `BatchGet=0`. The ready-made mechanism is
+`READ_REPLAY=true` (`run_tiered_cache_bench_dp8ep8.sh` L372-396 ->
+`bench_multiturn.py:run_read_replay`): after the write phase it calls
+`/flush_cache` (wipes HBM + host DRAM, **L3 storage tier survives**), then
+replays the same prompts so the prefix match misses L1/L2 and is served from
+L3 -> forces `batch_get_v1` BatchGet. **Always set `READ_REPLAY=true` when you
+want read bandwidth.** Do NOT try to force eviction by shrinking L2 below the
+27 GB device floor.
+
+### DRAM-only one-shot command (L3 DRAM -> L2 -> HBM)
+
+```bash
+cd /sgl-workspace/sglang && \
+MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1 \
+UMBP_LOG_LEVEL=0 CASES_OVERRIDE=case3:HBM_DRAM_SSD DUMMY_FORWARD=true \
+NUM_ROUNDS=40 NUM_CLIENTS=1 MAX_PARALLEL=1 HICACHE_SIZE=32 \
+UMBP_SSD_BACKEND=posix UMBP_SSD_BYTES=0 \
+DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh 2>&1 | tee /tmp/iobw_run.log; \
+echo "==================== IOBW RESULT (inline) ====================" && \
+RDIR="$(ls -1dt benchmark/hicache/results/tiered_cache_bench_dp8ep8/*/ 2>/dev/null | head -n1 | sed 's:/$::')" && \
+{ [ -n "$RDIR" ] && echo "results_dir = $RDIR" && \
+  ( python3 tools/iobw/summarize_iobw_jsonl.py "$RDIR"/**/iobw_*.jsonl 2>/dev/null \
+    || bash tools/iobw/diagnose_iobw_logs.sh "$RDIR" 2>&1 | grep -E "bandwidth|GiB/s|avg|max|count|IOBW" ) \
+  || echo "NO DATA: see /tmp/iobw_run.log"; }
+```
+
+## skyriver07 (8x MI300X)
+
+- Repo lives **inside the `storge` container**: `/sgl-workspace/sglang`
+  (the host terminal does NOT have this path — use `docker exec storge bash -lc "..."`).
+- Model (verified, has config.json, MLA arch, fits case3):
+  - `MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1`
+  - alt: `/mnt/nvme1/data/deepseek-r1-FP8-Dynamic-from-BF16`
+- SSD/SPDK:
+  - `UMBP_SSD_BACKEND=spdk_proxy`
+  - `UMBP_SPDK_NVME_PCI=0000:88:00.0`
+  - `UMBP_SPDK_PROXY_BIN=/opt/venv/lib/python3.10/site-packages/mori/spdk_proxy`
+- Always pass `DO_CHECKOUT=false` (repo has ROCm hipify-generated `*.hip`,
+  `include/hip/`, `utils_hip.h`, `sgl-kernel/sgl-kernel` symlink untracked files
+  that trip the clean-repo guard; code is already on the right branch).
+
+## Prerequisite: hugepages (run inside container, privileged)
+
+Each of 8 DP ranks needs ~7.45 GB DRAM-tier hugepage + proxy needs node0 headroom.
+Set both NUMA nodes to 32 GB each (64 GB total) BEFORE the bench, or spdk_proxy
+EAL fails to grab node0 memory:
+
+```bash
+echo 16384 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+echo 16384 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+grep HugePages_Total /proc/meminfo   # expect 32768
+```
+
+## Known-good one-shot command (read-bandwidth case3)
+
+Small L2 (`HICACHE_SIZE=8`) forces eviction to L3, prefix reuse triggers BatchGet
+(read bandwidth). Per the inline-results rule, end with the bandwidth summary printed.
+
+```bash
+cd /sgl-workspace/sglang && \
+MODEL_PATH=/mnt/nvme1/data/DeepSeekV3.1 \
+UMBP_SSD_BACKEND=spdk_proxy UMBP_SPDK_NVME_PCI=0000:88:00.0 \
+UMBP_SPDK_PROXY_BIN=/opt/venv/lib/python3.10/site-packages/mori/spdk_proxy \
+UMBP_LOG_LEVEL=0 CASES_OVERRIDE=case3:HBM_DRAM_SSD DUMMY_FORWARD=true \
+NUM_ROUNDS=40 NUM_CLIENTS=1 MAX_PARALLEL=1 HICACHE_SIZE=8 \
+DO_CHECKOUT=false tools/iobw/run_umbp_iobw_test.sh 2>&1 | tee /tmp/iobw_run.log; \
+echo "==================== IOBW RESULT (inline) ====================" && \
+RDIR="$(ls -1dt benchmark/hicache/results/tiered_cache_bench_dp8ep8/*/ 2>/dev/null | head -n1 | sed 's:/$::')" && \
+{ [ -n "$RDIR" ] && echo "results_dir = $RDIR" && \
+  ( python3 tools/iobw/summarize_iobw_jsonl.py "$RDIR"/**/iobw_*.jsonl 2>/dev/null \
+    || bash tools/iobw/diagnose_iobw_logs.sh "$RDIR" 2>&1 | grep -E "bandwidth|GiB/s|avg|max|count|IOBW" ) \
+  || echo "NO DATA: see /tmp/iobw_run.log"; }
+```
+
+If launched from the **host** shell, wrap with:
+`docker exec storge bash -lc "<command above>"`
+
+## HARD CONSTRAINT: HICACHE_SIZE must exceed the device KV pool
+
+`memory_pool_host.py` asserts `host_pool.size > device_pool.size`
+("The host memory should be larger than the device memory with the current
+protocol"). `HICACHE_SIZE` (GB) is converted to tokens via
+`HICACHE_SIZE*1e9 / size_per_token`, and that must exceed `device_pool.size`.
+
+Measured on skyriver07 / DeepSeekV3.1 / default mem-fraction:
+- device KV pool per rank = **27.04 GB / 413056 tokens** (`KV Cache is allocated. #tokens: 413056, KV size: 27.04 GB`).
+- Therefore **`HICACHE_SIZE` must be > 27.04 GB**. `HICACHE_SIZE=8` crashes every
+  scheduler with the AssertionError (parent then dies with `EOFError` from the
+  scheduler pipe). **Use `HICACHE_SIZE=32` (known-good).**
+- To still force eviction into L3 (to capture read bandwidth via BatchGet), do NOT
+  shrink L2 below the floor — instead drive a larger working set: more rounds /
+  longer prompts / more clients, or lower the device mem-fraction to drop the floor.
+
+## VERIFIED-PASSED command + result (banff, 2026-05-29)
+
+This exact shape PASSED end-to-end (case3, DUMMY_FORWARD):
+`NUM_ROUNDS=20 NUM_CLIENTS=1 MAX_PARALLEL=1 HICACHE_SIZE=32`, write_through,
+L2=32GB/rank, L3 DRAM=64GB/rank, L3 SSD=96GB/rank, backend=spdk_proxy.
+
+Result (recomputed from JSONL, source of truth):
+- BatchPut: 26 calls / 656 requests, 2.75 GiB written, **avg 1.405 GiB/s**
+  (p50 1.32 / p95 1.85 / max 1.86 GiB/s); batch ~137 MiB; per-call 75-106 ms.
+- **BatchGet = 0**: fresh cache is write-only on first pass. To measure READ
+  bandwidth you must run enough rounds with prefix reuse so data is read back
+  from L3 (BatchGet). Plan for multi-round + small-enough L2-vs-workingset.
+
+## mori config refactor: spdk_* fields are NESTED under cfg.ssd
+
+New mori `UMBPConfig` exposes all SPDK fields on `UMBPSsdConfig`
+(pybind: `pybind_umbp.cpp` ~L154-185), i.e. `cfg.ssd.spdk_*`, NOT top-level.
+Symptom if you use the old flat path:
+`AttributeError: 'libmori_pybinds.UMBPConfig' object has no attribute 'spdk_nvme_pci_addr'`
+(scheduler dies -> parent `EOFError` from scheduler pipe).
+
+Fixed in `umbp_store.py`: every `cfg.spdk_*` / `cfg.spdk_proxy_*` ->
+`cfg.ssd.spdk_*` (and `getattr(cfg, "spdk_proxy_*")` -> `getattr(cfg.ssd, ...)`).
+`cfg.ssd.ssd_backend` was already nested. If a fresh checkout reintroduces flat
+`cfg.spdk_*`, re-apply this nesting fix.
+
+## Health markers to watch
+`spdk_proxy: READY` -> `UMBPStore initialized ... ssd_backend=spdk_proxy` ->
+`Server is ready` -> `BatchPut done ... bandwidth_gib_s` ->
+(after enough rounds) `BatchGet done ... bandwidth_gib_s` (= read BW) -> `PASSED`.

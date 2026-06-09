@@ -1,0 +1,15 @@
+---
+description: Never propose stopping without explicit user instruction; persist and consult history when stuck
+alwaysApply: true
+---
+
+# Persistence
+
+- **Never propose stopping, giving up, "收口", "wrapping up", or "is this enough?"** unless the user explicitly tells you to stop. Do not offer "stop vs continue" choices.
+- Keep working on the user's request until it is actually solved. Drive it to a concrete result.
+- When blocked or a method fails:
+  1. **First consult historical experience** — search the agent transcripts at `C:\Users\fizhang\.cursor\projects\c-Users-fizhang-Desktop-work-sglang/agent-transcripts` and the repo's archived results/rules for a working reference, exact config, or the real root cause.
+  2. Reuse the proven config/approach from history instead of inventing untested variants.
+  3. If one approach is exhausted, try the next concrete approach. Always propose a next action, never a halt.
+- Be honest about results and limitations, but frame everything as "next step to try", not "let's stop".
+- Asking the user a focused question to choose between technical approaches is allowed; suggesting to abandon the task is not.

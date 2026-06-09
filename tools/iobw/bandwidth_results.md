@@ -47,3 +47,44 @@
 
 **DRAM→HBM 比 SSD load 快 2-4×** → **当前 2 盘 RAID0 的 SSD 不能透明取代 DRAM**：用 SSD 当源会把 load 卡在 ~13.6 GB/s（DRAM 能 27-57）。
 要让 SSD 追平：需 **4 盘 RAID0（~27 GB/s，追平实际 per-layer DRAM 速率）甚至 6-8 盘（追平饱和 57）**；或 workload per-layer 传输都很小（DRAM 也降到 0.4-27，差距缩小）。
+
+---
+
+## L3 UMBP DRAM tier 读优化（mori perf/dram-parallel-read-v2）
+
+`DRAMTier::ReadBatchIntoPtr` 原单线程 memcpy + 独占锁。改：shared_mutex 读读并发 + 多线程并行 memcpy + NT-store(跳 RFO) + 跨 CCD 物理核绑定。
+
+### 组件级带宽（微基准 bench_dram_batch_read.py，256MiB/批，taskset node0）
+
+| 线程 | memcpy(NT off) | **NT(默认)** |
+|---|---|---|
+| 1 | 7.85（基线） | 14.8（裸单核） |
+| 4 | 28.5 | **76.7** |
+| 8 | 44.8 | 133.8 |
+| 16 | 91.6 | 138.7 |
+| 32 | 113.7 | 140(峰值) |
+
+- 单 socket 拷贝上限 ~115（memcpy）/~140（NT），拐点 32-48 线程；>48 反降（内存控制器饱和 + spawn 开销）。
+- **绑核必须跨 CCD**：连续核堆单 GMI 链路反而慢 2x；跨 CCD 物理核散布才线性 scale。
+- **NT-store**：dst 是 staging、写完 DMA 走、CPU 不再读 → 跳 RFO，单核 14.8→23.7（1.67x），省核 + 抬天花板。
+- 默认 `UMBP_DRAM_READ_THREADS=4` + `UMBP_DRAM_NT_COPY` 开 + 绑核开。
+
+### E2E（全栈 DeepSeek-V3.1 MLA, DP8, case3 kernel backend）
+
+L3 读组件 E2E（BatchGet）：baseline 1核noNT **14.1** → 优化 4核NT **44.8**（3.2x，单批 38ms→12ms）。
+
+**但 E2E TTFT/吞吐：优化无效，穷尽验证：**
+
+| 场景 | Get | A(优化) vs B(baseline) |
+|---|---|---|
+| 8c/64c read-replay | 18 | prefetch_critical_path=0，相同 |
+| 128c rate200 饱和 | — | 都 87 req/s，TTFT 相同 |
+| 小池频繁读(mem-frac0.65) | ~680 | Median 0.15 vs 0.13、吞吐 15.3 vs 15.5，相同 |
+
+**根因**：① L3→host prefetch 被 hicache **异步提前发起**（请求入队即 prefetch、后台跑完），从不在关键路径（`prefetch_critical_path_sum=0`，连慢 baseline 都不阻塞）；prefill 类负载真正的墙是 compute/调度吞吐，不是 L3 读。② host→HBM 散列 gather（历史 direct ~6.0）是另一独立下游瓶颈。
+
+**定位**：组件级真 3.2x（省核/余量/CPU 效率）；prefill 服务 E2E 中性。唯一可能兑现的是 **decode-KV-offload**（每步 compute 极小、load 海量、结构性在关键路径），尚未测。
+
+### 附带修复
+- **kernel backend ROCm 跑通**：`SGLANG_HICACHE_HOST_REGISTER_FLAGS=2`（cudaHostRegisterMapped）让 host 池映射进 device 空间，`host_to_device_accessible_ptr`(memory_pool_host.py:835) 的 hipHostGetDevicePointer 才返回有效 devptr。默认 0（仅 page-lock）→ kernel GPU fault。CUDA 靠 UVA 无需此 flag——ROCm 特有配置，非代码 bug。
+- **umbp_store.py**：`cfg.ssd_backend → cfg.ssd.ssd_backend`（refactor mori config 迁移漏改字段）。

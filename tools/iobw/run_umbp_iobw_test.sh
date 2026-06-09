@@ -29,7 +29,9 @@ DO_RUN_BENCH="${DO_RUN_BENCH:-true}"
 DO_DIAGNOSE="${DO_DIAGNOSE:-true}"
 
 # --- Bench parameters (small-scale defaults that already passed) -------
-export MODEL_PATH="${MODEL_PATH:-/nfs/data/DeepSeek-V3}"
+# MODEL_PATH default is the verified skyriver07 model (has config.json, MLA).
+# Do NOT use /nfs/data/DeepSeek-V3 -- that path has no config.json on this box.
+export MODEL_PATH="${MODEL_PATH:-/mnt/nvme1/data/DeepSeekV3.1}"
 export CASES_OVERRIDE="${CASES_OVERRIDE:-case3:HBM_DRAM_SSD}"
 export DUMMY_FORWARD="${DUMMY_FORWARD:-true}"
 export NUM_ROUNDS="${NUM_ROUNDS:-20}"
@@ -37,8 +39,12 @@ export NUM_CLIENTS="${NUM_CLIENTS:-4}"
 export MAX_PARALLEL="${MAX_PARALLEL:-4}"
 export REQUEST_RATE="${REQUEST_RATE:-10}"
 export HICACHE_SIZE="${HICACHE_SIZE:-32}"
-export UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-spdk_proxy}"
-export UMBP_SPDK_NVME_PCI="${UMBP_SPDK_NVME_PCI:-0000:50:00.0}"
+# DRAM-only L3 by default (L3 DRAM tier -> L2 host DRAM -> HBM, no SSD/SPDK).
+# Set UMBP_SSD_BYTES=0 to disable the SSD tier; keep backend=posix so the bench
+# never injects spdk_* config fields. For an SSD run, set UMBP_SSD_BACKEND=spdk_proxy,
+# UMBP_SSD_BYTES>0, UMBP_SPDK_NVME_PCI=..., UMBP_SPDK_PROXY_BIN=... explicitly.
+export UMBP_SSD_BACKEND="${UMBP_SSD_BACKEND:-posix}"
+export UMBP_SSD_BYTES="${UMBP_SSD_BYTES:-0}"
 
 # --- IOBW logging knobs ------------------------------------------------
 export UMBP_IO_BW_STATS="${UMBP_IO_BW_STATS:-true}"
@@ -65,6 +71,12 @@ declare -a DIRTY_IGNORE_PATHS=(
     "umbp_iobw_logs/"
     "run_umbp_iobw_test.sh"
     "gpucore."
+    # ROCm hipify-generated artifacts (untracked on MI300X boxes); never block checkout.
+    ".hip"
+    "sgl-kernel/include/hip/"
+    "utils_hip.h"
+    "sgl-kernel/sgl-kernel"
+    ".cursor/rules/"
 )
 
 is_path_ignored_for_dirty() {
@@ -72,6 +84,10 @@ is_path_ignored_for_dirty() {
     for ignore in "${DIRTY_IGNORE_PATHS[@]}"; do
         # Allow either exact match, prefix match (dir), or filename match.
         if [[ "$p" == "$ignore" || "$p" == "$ignore"* ]]; then
+            return 0
+        fi
+        # Extension-style entry (starts with a dot, e.g. ".hip") -> suffix match.
+        if [[ "$ignore" == .* && "$p" == *"$ignore" ]]; then
             return 0
         fi
         local base

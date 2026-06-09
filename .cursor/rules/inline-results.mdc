@@ -1,0 +1,12 @@
+---
+description: Shell commands must print final results/metrics directly to the terminal in one shot
+alwaysApply: true
+---
+
+# Inline Results
+
+- Every experiment/benchmark command given to the user MUST **print the final key results/metrics directly to the terminal at the end of the same command** — a clear, labeled summary block. The user should never have to run a separate follow-up command to see the answer.
+- Run the workload in the **foreground** (or wait for it), then immediately compute and `echo` the parsed metrics (bandwidth, TTFT, counts, A/B comparison) with clear labels.
+- Prefer one self-contained command block: run → parse → print summary. No "then run this to check" second step for the core result.
+- Keep parsing robust (handle empty/missing with a printed note like `NO DATA: <reason>`), and use ASCII-only inside awk/python to avoid encoding errors.
+- Still acceptable to print progress while a long job runs, but the command must end with the conclusive result printed.

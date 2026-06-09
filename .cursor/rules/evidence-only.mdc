@@ -1,0 +1,15 @@
+---
+description: All claims must be strictly backed by proven/measured data; never speculate as fact
+alwaysApply: true
+---
+
+# Evidence-Only
+
+- **Every conclusion, number, bandwidth, bottleneck, or root-cause claim MUST be backed by data actually measured in this session (logs, metrics, command output).** No exceptions.
+- If something is NOT yet measured, label it explicitly as **"未验证假设 (hypothesis, must test)"** — never state it as fact, never put it in a results table as if measured.
+- Before claiming a root cause or "the bottleneck is X", first cite the exact measured numbers that prove it. If you can't cite them, you don't get to claim it.
+- Watch for confounds before concluding (e.g. comparing items with different sizes/contexts). State the confound; do not draw a conclusion the data can't support.
+- Do not infer bandwidth/latency from indirect proxies (e.g. tok/s) when a direct metric exists — use the direct measurement.
+- When a prior claim turns out unsupported, retract it explicitly and correct the record (and the archive).
+- Prefer "I don't know yet, here's the measurement that would tell us" over a confident guess.
+- Archive only proven results; mark assumptions/hypotheses as such in the archive too.

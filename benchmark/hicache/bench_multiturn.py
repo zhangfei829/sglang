@@ -762,11 +762,20 @@ def run_read_replay(generator, args, flush_cache_url):
 
     pbar = tqdm(total=len(histories), desc="read-replay")
     sem = asyncio.Semaphore(max(1, args.max_parallel))
+    replay_ttfts = []
+    replay_latencies = []
 
     async def replay_one(history):
         payload = gen_payload(history, 1, args.lora_path)
         async with sem:
-            await generator.request_func(payload, generator.url, pbar)
+            response = await generator.request_func(payload, generator.url, pbar)
+        if response is not None and getattr(response, "success", True):
+            ttft = getattr(response, "ttft", None)
+            if ttft:
+                replay_ttfts.append(ttft)
+            lat = getattr(response, "latency", None)
+            if lat:
+                replay_latencies.append(lat)
 
     async def drive():
         await asyncio.gather(*(replay_one(h) for h in histories))
@@ -778,6 +787,30 @@ def run_read_replay(generator, args, flush_cache_url):
     finally:
         loop.close()
         pbar.close()
+
+    # E2E TTFT of the replay phase: these requests must resolve their prefix
+    # from the storage tier (L3), so their TTFT is the load-path critical path.
+    def _pct(sorted_vals, q):
+        if not sorted_vals:
+            return 0.0
+        idx = min(len(sorted_vals) - 1, int(q * len(sorted_vals)))
+        return sorted_vals[idx]
+
+    st = sorted(replay_ttfts)
+    if st:
+        print(
+            "[read-replay][TTFT] n=%d avg=%.4fs p50=%.4fs p90=%.4fs p99=%.4fs max=%.4fs"
+            % (
+                len(st),
+                sum(st) / len(st),
+                _pct(st, 0.5),
+                _pct(st, 0.9),
+                _pct(st, 0.99),
+                st[-1],
+            )
+        )
+    else:
+        print("[read-replay][TTFT] no successful replay responses captured")
     print(
         "[read-replay] done. Look for 'batch_get_v1: UMBP BatchGet done ... "
         "bandwidth_gib_s' in server.log."
