@@ -2010,10 +2010,17 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        _gb_timing = os.environ.get("SGLANG_GETBATCH_TIMING") == "1"
+        if _gb_timing:
+            self.device_module.synchronize()
+            _gb_t0 = time.perf_counter()
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
+        if _gb_timing:
+            self.device_module.synchronize()
+            _gb_t1 = time.perf_counter()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -2036,7 +2043,22 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
+        if _gb_timing:
+            self.device_module.synchronize()
+            _gb_t2 = time.perf_counter()
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+        if _gb_timing:
+            self.device_module.synchronize()
+            _gb_t3 = time.perf_counter()
+            print(
+                "[GETBATCH] mode=%s prefill_sched_ms=%.3f mlp_sync_ms=%.3f"
+                % (
+                    str(ret.forward_mode) if ret is not None else "None",
+                    (_gb_t1 - _gb_t0) * 1000.0,
+                    (_gb_t3 - _gb_t2) * 1000.0,
+                ),
+                flush=True,
+            )
 
         if ret:
             set_schedule_time_batch(ret)
