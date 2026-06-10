@@ -7,16 +7,23 @@
 //   GiB/s vs ~26 for memcpy/NT (1.7x), because its stores never reached DRAM.
 //   The real path is different: each KV block is read ONCE from cold DRAM, the
 //   working set (all cached pages) far exceeds L3, and there are many threads.
-//   In that regime the cached copy's stores must writeback to DRAM (and may pay
-//   a read-for-ownership on dst), while NT stores bypass cache and skip the RFO.
-//   So the hot 1.7x may shrink or even invert. This bench settles it with the
-//   number that actually matters: aggregate GiB/s on cold data, vs thread count.
+//   In that regime the cached copy's stores must writeback to DRAM (and pay a
+//   read-for-ownership on dst), while NT stores bypass cache and skip the RFO.
+//   So the hot 1.7x shrinks or inverts. This bench settles it with the number
+//   that actually matters: aggregate GiB/s on cold data, vs thread count.
 //
-// Build (container, g++):
+//   DPDK rte_memcpy is a CACHED copy (loadu + ordinary storeu, non-temporal), so
+//   it is in the same class as avx512_cached. Build with -DUSE_DPDK to include
+//   it and confirm it tracks avx512_cached (and loses to NT) on cold data.
+//
+// Build (container, g++; NT/cached only):
 //   g++ -O3 -mavx512f -mavx512bw tools/iobw/bench_memcpy_mt.cpp -o /tmp/bmt -lpthread
-//   (drop -march; per-function target attr not needed here, we compile w/ avx512)
+// Build with DPDK rte_memcpy (headers are inline-only, no lib to link):
+//   DPDK_INC=/home/fizhang/spdk/dpdk/build/include
+//   g++ -O3 -mavx512f -mavx512bw -DUSE_DPDK -I"$DPDK_INC" -include rte_config.h \
+//       tools/iobw/bench_memcpy_mt.cpp -o /tmp/bmt -lpthread
 // Run:
-//   /tmp/bmt                       # defaults below
+//   /tmp/bmt
 //   BLOCK_KIB=4096 SET_MIB=4096 THREADS=1,2,4,8,16 PIN=1 /tmp/bmt
 //
 // Env knobs:
@@ -37,6 +44,10 @@
 #include <vector>
 #include <immintrin.h>
 #include <sched.h>
+
+#ifdef USE_DPDK
+#include <rte_memcpy.h>
+#endif
 
 static inline void nt_copy_avx512(char* d, const char* s, size_t n) {
   size_t head = (64 - (reinterpret_cast<uintptr_t>(d) & 63)) & 63;
@@ -76,14 +87,27 @@ static inline void cached_copy_avx512(char* d, const char* s, size_t n) {
   if (i < n) std::memcpy(d + i, s + i, n - i);
 }
 
-enum Method { M_MEMCPY = 0, M_CACHED, M_NT, M_N };
-static const char* kMethodNames[M_N] = {"memcpy", "avx512_cached", "avx512_nt"};
+typedef void (*CopyFn)(char*, const char*, size_t);
+static void fn_memcpy(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
+static void fn_cached(char* d, const char* s, size_t n) { cached_copy_avx512(d, s, n); }
+static void fn_nt(char* d, const char* s, size_t n) { nt_copy_avx512(d, s, n); }
+#ifdef USE_DPDK
+static void fn_dpdk(char* d, const char* s, size_t n) { rte_memcpy(d, s, n); }
+#endif
 
-static inline void copy_one(int m, char* d, const char* s, size_t n) {
-  if (m == M_MEMCPY) std::memcpy(d, s, n);
-  else if (m == M_CACHED) cached_copy_avx512(d, s, n);
-  else nt_copy_avx512(d, s, n);
-}
+struct MethodDef {
+  const char* name;
+  CopyFn fn;
+};
+static const MethodDef kMethods[] = {
+    {"memcpy", fn_memcpy},
+    {"avx512_cached", fn_cached},
+    {"avx512_nt", fn_nt},
+#ifdef USE_DPDK
+    {"rte_memcpy", fn_dpdk},
+#endif
+};
+static const int kNMethods = sizeof(kMethods) / sizeof(kMethods[0]);
 
 static size_t env_sz(const char* k, size_t def) {
   const char* v = std::getenv(k);
@@ -106,7 +130,7 @@ static std::vector<int> parse_threads() {
 
 // One timed pass: T threads work-steal blocks via an atomic counter (exactly
 // like ReadBatchIntoPtr). Returns aggregate GiB/s for the whole set.
-static double run_pass(int method, int threads, char* src, char* dst,
+static double run_pass(CopyFn fn, int threads, char* src, char* dst,
                        size_t nblocks, size_t bs, bool pin) {
   std::atomic<size_t> next{0};
   auto worker = [&](int tid) {
@@ -118,7 +142,7 @@ static double run_pass(int method, int threads, char* src, char* dst,
     }
     size_t i;
     while ((i = next.fetch_add(1, std::memory_order_relaxed)) < nblocks)
-      copy_one(method, dst + i * bs, src + i * bs, bs);
+      fn(dst + i * bs, src + i * bs, bs);
   };
   auto t0 = std::chrono::high_resolution_clock::now();
   std::vector<std::thread> pool;
@@ -153,23 +177,23 @@ int main() {
   printf("# aggregate GiB/s (best of %d rounds), each block copied once per round\n",
          rounds);
   printf("%-8s", "threads");
-  for (int m = 0; m < M_N; ++m) printf("%16s", kMethodNames[m]);
-  printf("%14s\n", "cached/memcpy");
+  for (int m = 0; m < kNMethods; ++m) printf("%16s", kMethods[m].name);
+  printf("%14s\n", "nt/memcpy");
 
   for (int T : tlist) {
-    double best[M_N] = {0, 0, 0};
-    for (int m = 0; m < M_N; ++m) {
-      // warm the buffers' page tables but keep data cold relative to L3 by
-      // touching the whole (huge) set; one untimed pass also faults pages in.
-      run_pass(m, T, src, dst, nblocks, bs, pin);
+    std::vector<double> best(kNMethods, 0.0);
+    for (int m = 0; m < kNMethods; ++m) {
+      // untimed pass: fault pages in + keep data cold relative to L3 (set >> L3)
+      run_pass(kMethods[m].fn, T, src, dst, nblocks, bs, pin);
       for (int r = 0; r < rounds; ++r) {
-        double g = run_pass(m, T, src, dst, nblocks, bs, pin);
+        double g = run_pass(kMethods[m].fn, T, src, dst, nblocks, bs, pin);
         if (g > best[m]) best[m] = g;
       }
     }
     printf("%-8d", T);
-    for (int m = 0; m < M_N; ++m) printf("%16.1f", best[m]);
-    printf("%14.2f\n", best[M_MEMCPY] > 0 ? best[M_CACHED] / best[M_MEMCPY] : 0.0);
+    for (int m = 0; m < kNMethods; ++m) printf("%16.1f", best[m]);
+    // nt is index 2, memcpy is index 0
+    printf("%14.2f\n", best[0] > 0 ? best[2] / best[0] : 0.0);
   }
   free(src);
   free(dst);
