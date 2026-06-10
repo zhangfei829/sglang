@@ -1,14 +1,35 @@
-# UMBP IO 带宽优化 — 进展存档（2026-06-10）
+# UMBP IO 带宽优化 — 进展存档（2026-06-10 更新）
 
-明天接着干用这个文件恢复上下文。一句话状态：**已实现并推送 dram_tier 缓存拷贝优化（cached AVX-512），等容器重编 + 全栈带宽 A/B 验证。**
+一句话状态：**冷数据多线程实测推翻了 cached-copy 方向；已改为 NT-store 并推送（mori `b1716a9a`），等容器重编 + 全栈带宽验证（预期 31→~45+）。**
+
+## ⚠️ 重大修正（2026-06-10 上午）
+
+`tools/iobw/bench_memcpy_mt.cpp`（冷数据、4GiB 工作集、多线程，复刻 ReadBatchIntoPtr）实测：
+
+```
+threads   memcpy  avx512_cached  avx512_nt   cached/memcpy   (no-pin, GiB/s)
+1          14.8     16.7          23.5         1.13
+2          28.2     31.7          45.6         1.13
+4          51.9     50.9          81.9         0.98
+8          87.7     74.7         130.4         0.85
+16        126.1     99.3         146.2         0.79
+```
+
+- **NT 完胜**：8 线程 130 = cached 1.75x / memcpy 1.48x，所有线程数都赢。
+- **cached 在冷数据下比 memcpy 还慢**（ratio<1）。昨天单核 45（1.7x）是**热 cache 假象**——反复拷同一 buffer，store 不落 DRAM。
+- 原因：冷数据下 cached store 要 RFO+writeback = **3× 内存流量**；NT 绕 cache 无 RFO = **2×**。内存带宽受限时 NT 必赢。
+- **PIN=1 全面更差**（16 线程 NT 146→50）：绑 cpu 0..T-1 把线程挤在单 NUMA node，带宽锁死。**不要绑核**（远程版本来不绑，正确）。
+
+→ 已把 dram_tier 的 cached-copy 改成 **NT-store（≥256KiB 用 NT，小块 memcpy）**，env `UMBP_DRAM_NT_COPY=0` 可关。提交 `b1716a9a`。
 
 ---
 
 ## 1. 最新改动（已 commit + push）
 
 仓库：`zhangfei829/mori`，分支 `perf/dram-parallel-read`
-- 提交：`ecd20678`（在远程 tip `6710038f` 之上，干净 fast-forward）
+- 提交：`b1716a9a`（NT-store，当前 tip）；`ecd20678`（旧 cached-copy，已被上面修正覆盖，**别用**）
 - 文件：`mori/src/umbp/local/tiers/dram_tier.cpp`
+- 现状：`CopyBlock` → ≥256KiB 用 `NtCopyAvx512`（streaming store + sfence），小块 memcpy；`UMBP_DRAM_NT_COPY=0` 关闭。
 
 > 注意：dram_tier.cpp 属于 **mori 独立仓库**，不在 sglang 的 git 里。sglang 侧的工具分支是 `test/umbp-io-bandwidth-stats-tools`（已推 `iobw` remote）。
 
