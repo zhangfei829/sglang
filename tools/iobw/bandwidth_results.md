@@ -85,6 +85,51 @@ L3 读组件 E2E（BatchGet）：baseline 1核noNT **14.1** → 优化 4核NT **
 
 **定位**：组件级真 3.2x（省核/余量/CPU 效率）；prefill 服务 E2E 中性。唯一可能兑现的是 **decode-KV-offload**（每步 compute 极小、load 海量、结构性在关键路径），尚未测。
 
+### 本轮干净 A/B（2026-06-09, skyriver07, DRAM-only, READ_REPLAY, page_first posix）
+
+条件：`case3` DRAM-only（`UMBP_SSD_BYTES=0` posix）、`DUMMY_FORWARD=true`、`NUM_ROUNDS=20 NUM_CLIENTS=16 MAX_PARALLEL=16`、`HICACHE_SIZE=32`(L2)、`UMBP_DRAM_BYTES=64GB`(L3)、`READ_REPLAY=true`、device KV pool=27.04GB/413056 tokens/rank。
+A/B 唯一变量 = `UMBP_DRAM_READ_THREADS`（1=优化前 vs 4=优化后）。E2E TTFT 取 replay 阶段（L3 载入在 prefill 关键路径）的 `[read-replay][TTFT]`。
+
+| 指标 | 优化前 threads=1 | 优化后 threads=4 | 变化 |
+|---|---|---|---|
+| **L3 DRAM 读带宽 avg** | 21.74 GiB/s | **34.40 GiB/s** | **+58% (1.58x)** |
+| 读带宽 p50 | 21.65 | 36.01 | +66% |
+| 读带宽 p95 / max | 24.39 / 24.72 | 46.08 / 46.20 | +89% / +87% |
+| L3 读总耗时（聚合） | 355.4 ms | 196.6 ms | −45% |
+| BatchGet 调用 / 数据量 | 15 / 8.29 GB | 14 / 7.26 GB | — |
+| L3 DRAM 写带宽 (BatchPut) | 15.99 GiB/s | 15.91 GiB/s | ~0%（读优化不影响写，预期） |
+| **E2E replay TTFT avg** | 0.2037 s | 0.2018 s | **−0.9%（噪声内）** |
+| E2E replay TTFT p50 | 0.2208 s | 0.2035 s | −7.8% |
+| E2E replay TTFT p99 | 0.2360 s | 0.2252 s | −4.6% |
+
+**结论（数据支撑，不外推）**：读优化组件级 1.58x 有效；E2E TTFT 基本不动（~1%，噪声内）。量化原因：每请求 L3 读 ≈ 8.3GB/16/8rank ≈ 65MB/rank，在 21.7→34.4 GiB/s 下耗时 ~3ms→~1.8ms，占 204ms TTFT 仅 ~1% → 读带宽翻倍在 E2E 不可见。**L3 DRAM 读不是 TTFT 关键路径。**
+
+### L2 DRAM->HBM 后端优化前后对比（kernel 自比 + direct 自比，2026-06-09 定稿）
+
+skyriver07 / MI300X / DeepSeekV3.1 MLA。各后端自比，page_size 固定（不改 KV 粒度避免影响命中率）。
+
+| 后端 | 优化旋钮 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|---|
+| kernel | `SGLANG_HICACHE_BLOCK_QUOTA` 2->4 | 5.38 GiB/s | 10.31 GiB/s | 1.92x |
+| direct | `SGLANG_HICACHE_DIRECT_STREAMS`（多流） | 6.0 GiB/s | 8.28 GiB/s | 1.38x |
+
+- kernel 数据来自 `bench_blockquota.py` 隔离微基准（一次 kernel 搬 2432 token）。完整 sweep：
+  block_quota 2=5.38 / 4=10.31 / 16=34.75 / 64=44.88 / 152~4096≈47（饱和）GiB/s。
+  按工作点取 block_quota=4=10.31（per-layer 真实负载每层页数少，4 是实际工作点；4096 是过度配置的饱和上限）。
+- direct 数据为全栈 per-layer AGG：1 流 6.0 -> 多流 8.28（隔离 8 流可达 21.74，但全栈受 per-layer 碎片限制）。
+- **E2E 注脚（实测）**：真实 forward 下 `load_back_critical_path_seconds_sum` 整轮仅 0.171s（543 次，占 TTFT 12-21s/轮 的 <0.1%）。load 已被逐层计算遮住、不在关键路径 -> 上述组件级提升（1.92x / 1.38x）对 E2E TTFT 几乎零收益。
+
+### Grafana/Prometheus 实测坐实「load 不在关键路径」（2026-06-09）
+
+常驻 server（真实 forward，无 dummy）+ 32 client × 30 round 多轮复用，Prometheus 抓 `:30000/metrics`。
+查询 `sum(sglang:load_back_critical_path_seconds_sum) / sum(sglang:time_to_first_token_seconds_sum)`：
+
+- 结果 = **1.82e-6 ≈ 0.00018%**（load 阻塞累计 0.0242s vs TTFT 总量 ~13000s）。
+- 即 compute 阻塞在 host->device load 上的时间占 TTFT 的百万分之二，TTFT 的 99.9998% 是真实 compute。
+- **坐实**：L3 读优化（1.58x）、L2->HBM load 优化（kernel 1.92x / direct 1.38x）组件级有效，但 **E2E TTFT 收益 ≈ 0**——load 不在关键路径（per-layer load 与逐层 compute 流水重叠 + prefetch 异步提前发起，load 被 compute 完全遮住）。
+- 与历史 dummy-forward 下 `load_back_critical_path=0.171s/543次（<0.1%）` 完全一致，两种测法互证。
+- **降 TTFT 的正确方向 = prefill compute / 调度吞吐，不是 load 带宽。**
+
 ### 附带修复
 - **kernel backend ROCm 跑通**：`SGLANG_HICACHE_HOST_REGISTER_FLAGS=2`（cudaHostRegisterMapped）让 host 池映射进 device 空间，`host_to_device_accessible_ptr`(memory_pool_host.py:835) 的 hipHostGetDevicePointer 才返回有效 devptr。默认 0（仅 page-lock）→ kernel GPU fault。CUDA 靠 UVA 无需此 flag——ROCm 特有配置，非代码 bug。
-- **umbp_store.py**：`cfg.ssd_backend → cfg.ssd.ssd_backend`（refactor mori config 迁移漏改字段）。
+- **umbp_store.py**：`cfg.ssd_backend → cfg.ssd.ssd_backend` + 所有 `cfg.spdk_* → cfg.ssd.spdk_*`（refactor mori config 把 spdk 字段全迁到 ssd 子配置）。
