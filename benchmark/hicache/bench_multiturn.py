@@ -753,6 +753,35 @@ def run_read_replay(generator, args, flush_cache_url):
         print("[read-replay] no histories to replay; skipping.")
         return
 
+    # Pre-warm: prefill each FULL history once so its ENTIRE KV lands in the
+    # storage tier. The main write run only wrote per-round prefixes, so the
+    # final-round tail isn't in storage -> on replay it gets recomputed
+    # (#new-token > 0). With pre-warm + flush, replay's prefix match resolves
+    # ~100% from storage (#new-token -> ~0), making the request load-bound
+    # (compute ~0) -- the regime where L3-read bandwidth can actually move TTFT.
+    # Disable with READ_REPLAY_PREWARM=0.
+    if os.environ.get("READ_REPLAY_PREWARM", "1") != "0":
+        print(f"[read-replay] pre-warming {len(histories)} full histories into storage...")
+        pw_pbar = tqdm(total=len(histories), desc="prewarm")
+        pw_sem = asyncio.Semaphore(max(1, args.max_parallel))
+
+        async def prewarm_one(history):
+            payload = gen_payload(history, 1, args.lora_path)
+            async with pw_sem:
+                await generator.request_func(payload, generator.url, pw_pbar)
+
+        async def prewarm_drive():
+            await asyncio.gather(*(prewarm_one(h) for h in histories))
+
+        pw_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(pw_loop)
+        try:
+            pw_loop.run_until_complete(prewarm_drive())
+        finally:
+            pw_loop.close()
+            pw_pbar.close()
+        time.sleep(3)  # let write_through propagate the tail into storage
+
     print(
         f"\n[read-replay] flushing HBM/DRAM (storage tier survives), then replaying "
         f"{len(histories)} prompts to force storage reads (BatchGet)..."
