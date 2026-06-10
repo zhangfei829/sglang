@@ -1,35 +1,37 @@
 # UMBP IO 带宽优化 — 进展存档（2026-06-10 更新）
 
-一句话状态：**冷数据多线程实测推翻了 cached-copy 方向；已改为 NT-store 并推送（mori `b1716a9a`），等容器重编 + 全栈带宽验证（预期 31→~45+）。**
+一句话状态：**冷数据多线程实测定论 = AVX2 NT 最优（~1.47x over memcpy @8线程）。dram_tier 已改回 AVX2 NT 并推送（mori `3b98bd05`），等容器重编 + 全栈带宽验证（预期 31→~45+）。**
 
-## ⚠️ 重大修正（2026-06-10 上午）
+## ⚠️ 最终定论（2026-06-10 上午，决定性实测）
 
-`tools/iobw/bench_memcpy_mt.cpp`（冷数据、4GiB 工作集、多线程，复刻 ReadBatchIntoPtr）实测：
+`tools/iobw/bench_memcpy_mt.cpp`（冷数据、4GiB 工作集、多线程、不绑核，复刻 ReadBatchIntoPtr）实测：
 
 ```
-threads   memcpy  avx512_cached  avx512_nt   cached/memcpy   (no-pin, GiB/s)
-1          14.8     16.7          23.5         1.13
-2          28.2     31.7          45.6         1.13
-4          51.9     50.9          81.9         0.98
-8          87.7     74.7         130.4         0.85
-16        126.1     99.3         146.2         0.79
+threads   memcpy  avx512_cached  avx512_nt   avx2_nt   rte_memcpy   nt/memcpy
+1          14.9     16.7          23.4        24.3       16.9         1.57
+2          28.3     31.5          45.3        47.1       32.4         1.60
+4          52.2     50.4          80.5        87.8       55.7         1.54
+8          88.4     76.5         130.2       133.5       82.6         1.47   <- 默认 8 线程甜点
+16        126.0     99.1         148.3       148.4      100.8         1.18   <- 都逼近 DRAM 天花板~148
 ```
 
-- **NT 完胜**：8 线程 130 = cached 1.75x / memcpy 1.48x，所有线程数都赢。
-- **cached 在冷数据下比 memcpy 还慢**（ratio<1）。昨天单核 45（1.7x）是**热 cache 假象**——反复拷同一 buffer，store 不落 DRAM。
-- 原因：冷数据下 cached store 要 RFO+writeback = **3× 内存流量**；NT 绕 cache 无 RFO = **2×**。内存带宽受限时 NT 必赢。
-- **PIN=1 全面更差**（16 线程 NT 146→50）：绑 cpu 0..T-1 把线程挤在单 NUMA node，带宽锁死。**不要绑核**（远程版本来不绑，正确）。
+排序（8 线程，冷数据真实路径）：**avx2_nt 133 > avx512_nt 130 > memcpy 88 > rte_memcpy 83 ≈ cached 77**。
 
-→ 已把 dram_tier 的 cached-copy 改成 **NT-store（≥256KiB 用 NT，小块 memcpy）**，env `UMBP_DRAM_NT_COPY=0` 可关。提交 `b1716a9a`。
+- **AVX2 NT 最优**，比 AVX-512 NT 还略快：Zen4 的 512-bit 是 256-bit 通路 double-pump，无宽度优势 + 可能触发 AVX-512 降频；NT 瓶颈是 WC-buffer drain，256-bit 已喂满。→ **原始 `e504bf50` 的 AVX2 NT 方向本来就对**。
+- **cached / DPDK rte_memcpy 是同一类（缓存存）**，冷数据下比 memcpy 还慢（RFO+writeback = 3× 内存流量 vs NT 2×）。昨天单核 cached 45（1.7x）是**热 cache 假象**。DPDK 不仅不快还加依赖，**否决**。
+- **PIN=1 全面更差**（16 线程 NT 146→50）：绑 cpu 0..T-1 挤在单 NUMA node 锁死带宽。**不要绑核**（远程版本来不绑，正确）。
+- 16 线程 nt/memcpy 掉到 1.18：memcpy 也逼近 DRAM 带宽天花板 ~148。**8 线程是甜点（dram_tier 默认就是 8）**。
+
+→ dram_tier `CopyBlock`：≥256KiB 用 **`NtCopyAvx2`（AVX2 streaming store + sfence）**，小块 memcpy；`UMBP_DRAM_NT_COPY=0` 可关。提交 `3b98bd05`（覆盖了中途错误的 `ecd20678` cached 和 `b1716a9a` avx512_nt）。
 
 ---
 
 ## 1. 最新改动（已 commit + push）
 
 仓库：`zhangfei829/mori`，分支 `perf/dram-parallel-read`
-- 提交：`b1716a9a`（NT-store，当前 tip）；`ecd20678`（旧 cached-copy，已被上面修正覆盖，**别用**）
+- 提交：`3b98bd05`（**AVX2 NT，当前 tip，最终方案**）；中途的 `ecd20678`(cached) / `b1716a9a`(avx512_nt) 已被覆盖，**别用**。
 - 文件：`mori/src/umbp/local/tiers/dram_tier.cpp`
-- 现状：`CopyBlock` → ≥256KiB 用 `NtCopyAvx512`（streaming store + sfence），小块 memcpy；`UMBP_DRAM_NT_COPY=0` 关闭。
+- 现状：`CopyBlock` → ≥256KiB 用 `NtCopyAvx2`（256-bit streaming store + sfence），小块 memcpy；`UMBP_DRAM_NT_COPY=0` 关闭。
 
 > 注意：dram_tier.cpp 属于 **mori 独立仓库**，不在 sglang 的 git 里。sglang 侧的工具分支是 `test/umbp-io-bandwidth-stats-tools`（已推 `iobw` remote）。
 
