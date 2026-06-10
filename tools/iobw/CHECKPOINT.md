@@ -1,6 +1,32 @@
 # UMBP IO 带宽优化 — 进展存档（2026-06-10 更新）
 
-一句话状态：**冷数据多线程实测定论 = AVX2 NT 最优（~1.47x over memcpy @8线程）。dram_tier 已改回 AVX2 NT 并推送（mori `3b98bd05`），等容器重编 + 全栈带宽验证（预期 31→~45+）。**
+一句话状态：**冷数据多线程实测定论 = AVX2 NT 最优（~1.47x over memcpy @8线程）。dram_tier 已改回 AVX2 NT 并推送（mori `3b98bd05`）。E2E 调查见下「E2E 收益最终结论」。**
+
+## E2E 收益最终结论（2026-06-10/11，实测，关键）
+
+**只认实测、禁推断（见 `.cursor/rules/evidence-only.mdc`）。**
+
+| 场景 | read 优化（read_threads/带宽）对 TTFT 的 E2E 收益 | 证据 |
+|---|---|---|
+| **dummy-forward + wait_complete + load-heavy(8192,并发4)** | **稳定 −6.6%（n=8 配对 t, p≈0.01 显著）** ✅ | 带宽×1.67(22.6→37.8)；run 方差小 |
+| **真实 forward（GPU 独占，干净）** | **无可辨别收益**（2 对配对差方向相反 −2.45/+4.35s, p≈0.8） ❌ | run 方差秒级(±3-4s)>> ms 信号 |
+| **真实 forward（Prometheus 常驻）** | `load_back_critical_path/TTFT ≈ 2e-6` ≈ 0 ❌ | 互证 |
+
+**机理（实测+代码支撑）**：真实 forward 下 per-layer load(DRAM→HBM 27-39GiB/s,几百μs/层) << per-layer compute(几ms/层)，load 与 compute 流水重叠 + prefetch 异步提前 → load 不在关键路径。"数据量大≠时间占比大"。
+
+**关键教训**：
+1. 测真实 forward **必须先验证 GPU 独占**（`rocm-smi --showuse` + prefill throughput ~1240 token/s）。之前真实 forward 的"假收益"是**残留 sglang server 竞争污染**（throughput 被压到 18，慢 67x）导致的，清场后方向就乱了。
+2. read-replay 的 `replay-TTFT` n=client数；低并发降噪与放大 load 占比互斥。
+3. read-replay 默认 `#new-token=2048`（最后一轮 prefix 没写入 storage）→ 仍有真实 prefill compute 主导。
+
+## 路1 实验（构造 load-bound 场景，进行中→夜跑）
+
+**目的**：构造"load 多、compute 少"场景，看 read 优化在真实 forward 下能否显出 E2E。
+**手段**：`bench_multiturn.py` 加 `READ_REPLAY_PREWARM`（已 push）——replay 前先 prefill 完整 history 写入 storage，flush 后重放 → prefix ~100% 命中（`#new-token→~0`）→ 请求 load-bound。
+- 已修 bug：`import os` 缺失（commit `07e1acd08`，之前 NameError 崩 replay）。
+- **夜跑（2026-06-11 凌晨）**：T=1/T=2 各 4 次（8 轮，~3.5h），结果写 `/tmp/night_results.txt`。
+- **明天查**：`cat /tmp/night_results.txt`，按每轮的 ① prewarm 执行>0 ② replay #new小/#cached大(load-bound成立) ③ throughput~1240(GPU独占) 筛有效轮，再算 T=1 vs T=2 配对检验。
+- **红线（用户强调，不造假）**：prewarm 模拟"长 prefix 之前已处理过"的真实场景；replay-TTFT 如实；结论须标注"仅 load-bound 高命中场景"，不可泛化成通用 prefill。
 
 ## ⚠️ 最终定论（2026-06-10 上午，决定性实测）
 
