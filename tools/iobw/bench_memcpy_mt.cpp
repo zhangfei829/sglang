@@ -49,6 +49,30 @@
 #include <rte_memcpy.h>
 #endif
 
+// AVX2 (256-bit / 32B) non-temporal store -- the original dram_tier NtCopy.
+static inline void nt_copy_avx2(char* d, const char* s, size_t n) {
+  size_t head = (32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31;
+  if (head > n) head = n;
+  std::memcpy(d, s, head);
+  size_t i = head;
+  for (; i + 128 <= n; i += 128) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+    __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+    __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), b);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), c);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), e);
+  }
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+  }
+  if (i < n) std::memcpy(d + i, s + i, n - i);
+  _mm_sfence();
+}
+
 static inline void nt_copy_avx512(char* d, const char* s, size_t n) {
   size_t head = (64 - (reinterpret_cast<uintptr_t>(d) & 63)) & 63;
   if (head > n) head = n;
@@ -91,6 +115,7 @@ typedef void (*CopyFn)(char*, const char*, size_t);
 static void fn_memcpy(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
 static void fn_cached(char* d, const char* s, size_t n) { cached_copy_avx512(d, s, n); }
 static void fn_nt(char* d, const char* s, size_t n) { nt_copy_avx512(d, s, n); }
+static void fn_nt_avx2(char* d, const char* s, size_t n) { nt_copy_avx2(d, s, n); }
 #ifdef USE_DPDK
 static void fn_dpdk(char* d, const char* s, size_t n) { rte_memcpy(d, s, n); }
 #endif
@@ -103,6 +128,7 @@ static const MethodDef kMethods[] = {
     {"memcpy", fn_memcpy},
     {"avx512_cached", fn_cached},
     {"avx512_nt", fn_nt},
+    {"avx2_nt", fn_nt_avx2},
 #ifdef USE_DPDK
     {"rte_memcpy", fn_dpdk},
 #endif
