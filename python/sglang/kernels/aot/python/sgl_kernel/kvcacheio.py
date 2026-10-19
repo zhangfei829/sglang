@@ -1,3 +1,4 @@
+import functools
 import os
 from typing import List, Optional
 
@@ -16,14 +17,22 @@ def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
     return torch.ops.sgl_kernel.get_device_accessible_ptr.default(tensor, device_index)
 
 
+@functools.lru_cache(maxsize=1)
+def _is_gfx1250() -> bool:
+    # Same test as sglang.srt.utils.common.is_gfx1250_supported;
+    # sgl_kernel does not import sglang.srt.
+    return _is_hip and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+
+
 def _default_mla_block_quota() -> int:
     """CU (block) quota for the MLA page_first KV gather kernel.
 
-    Defaults to 16 on ROCm / 2 on CUDA. Override with the
+    Defaults to 32 on gfx1250 (16 blocks stop short of the ~100 GB/s host link
+    there), 16 on other ROCm GPUs such as gfx950, 2 on CUDA. Override with the
     SGLANG_HICACHE_BLOCK_QUOTA environment variable to tune how many CUs the
     kernel is launched with.
     """
-    default = 16 if _is_hip else 2
+    default = (32 if _is_gfx1250() else 16) if _is_hip else 2
     override = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
     if override is None:
         return default
