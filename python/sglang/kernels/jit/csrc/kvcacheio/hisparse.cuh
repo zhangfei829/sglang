@@ -16,9 +16,18 @@
 namespace sglang {
 
 #ifdef USE_ROCM
+// HIP's ballot is always 64-bit. gfx12 (e.g. gfx1250) runs wave32, the other ROCm targets wave64. The host pass has
+// no target and takes 32: SmemLayout::BYTES is sized there, and the wave32 layout is the larger one, so it covers
+// whichever wave size the device code was built for.
+#if defined(__GFX12__) || !defined(__HIP_DEVICE_COMPILE__)
+constexpr int WARP_SIZE = 32;
+using BallotMask = uint64_t;
+constexpr BallotMask FULL_WARP_MASK = 0x00000000FFFFFFFFull;
+#else
 constexpr int WARP_SIZE = 64;
 using BallotMask = uint64_t;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
+#endif
 #else
 constexpr int WARP_SIZE = 32;
 using BallotMask = unsigned int;
